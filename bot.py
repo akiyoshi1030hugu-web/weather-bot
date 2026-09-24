@@ -204,6 +204,10 @@ class WeatherBot(discord.Client):
             return f"#{src.channel} が見つかりません(/setup_weather を実行)"
 
         pdf = await self.get_bytes(src.url)
+        digest = hashlib.sha256(pdf).hexdigest()
+        if self.state.get(f"{src.key}:sha256") == digest:
+            self.state[src.key] = fp
+            return "更新なし(内容が同じ)"
         images = await asyncio.to_thread(render_pdf, pdf, src.pages)
 
         description = src.note
@@ -236,6 +240,7 @@ class WeatherBot(discord.Client):
                     await channel.send(file=discord.File(io.BytesIO(d), filename=nm),
                                        **(kwargs if i == 0 else {}))
         self.state[src.key] = fp
+        self.state[f"{src.key}:sha256"] = digest
         return "✅ 投稿しました"
 
     # ----- 地上実況天気図 -----
