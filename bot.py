@@ -15,6 +15,7 @@ import pymupdf
 from discord import app_commands
 from discord.ext import tasks
 
+from amedas import AmedasTable
 from mode import Mode, ModeWatcher
 from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
 from sources import CHANNEL_LAYOUT, PDF_SOURCES, USER_AGENT, WEATHER_MAPS, AsasSource, PdfSource
@@ -102,6 +103,7 @@ class WeatherBot(discord.Client):
         self.session: aiohttp.ClientSession | None = None
         self.composer: TileComposer | None = None
         self.mode: ModeWatcher | None = None
+        self.amedas: AmedasTable | None = None
         self.lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
@@ -111,6 +113,7 @@ class WeatherBot(discord.Client):
         )
         self.composer = TileComposer(self.session)
         self.mode = ModeWatcher(self.session)
+        self.amedas = AmedasTable(self.session)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         try:
@@ -162,6 +165,7 @@ class WeatherBot(discord.Client):
                 await asyncio.sleep(2)  # 連続アクセスを避ける
             for wm in WEATHER_MAPS:
                 results.append(await self.safe(wm.title, self.check_weather_map(wm)))
+            results.append(await self.safe("アメダス一覧表", self.check_amedas()))
             results.append(await self.safe("投稿間隔の自動判定", self.update_mode()))
             for product in IMAGE_PRODUCTS:
                 results.append(await self.safe(product.title, self.check_image(product)))
@@ -254,6 +258,34 @@ class WeatherBot(discord.Client):
         await channel.send(embed=embed,
                            file=discord.File(io.BytesIO(png), filename=f"{src.key}.png"))
         self.state[src.key] = filename
+        return "✅ 投稿しました"
+
+    # ----- アメダス一覧表 -----
+    def amedas_embed(self, t: datetime, table: str, missing: list[str]) -> discord.Embed:
+        utc = t.astimezone(timezone.utc)
+        embed = discord.Embed(title=f"アメダス観測値 {t:%m/%d %H:%M} JST({utc:%H} UTC)",
+                              url="https://www.jma.go.jp/bosai/amedas/",
+                              description=f"```\n{table}\n```", color=0xDD6B20)
+        embed.add_field(name="出典", value="気象庁 アメダス(速報値)", inline=True)
+        embed.add_field(name="単位", value="℃・%・hPa・m/s・mm", inline=True)
+        if missing:
+            embed.add_field(name="見つからなかった地点", value="、".join(missing), inline=False)
+        embed.set_footer(text="―は欠測・未観測・品質確認中|3h変化は3時間前の海面気圧との差")
+        return embed
+
+    async def check_amedas(self) -> str:
+        latest = await self.amedas.latest_time()
+        t = self.amedas.latest_synoptic(latest)
+        if t is None:
+            return "投稿対象の時刻がありません(AMEDAS_HOURS を確認)"
+        if (msg := self.is_new("amedas", t.isoformat())) is not None:
+            return msg
+        channel = self.find_channel("アメダス")
+        if channel is None:
+            return "#アメダス が見つかりません(/setup_weather を実行)"
+        table, missing = await self.amedas.build(t)
+        await channel.send(embed=self.amedas_embed(t, table, missing))
+        self.state["amedas"] = t.isoformat()
         return "✅ 投稿しました"
 
     # ----- 投稿間隔の自動切り替え -----
@@ -357,6 +389,14 @@ async def show_mode(interaction: discord.Interaction) -> None:
     reason = f"\n理由:{m.reason}" if m.reason else ""
     await interaction.response.send_message(
         f"現在は **{m.name}モード**(画像は{m.interval}分ごと)です。{reason}", ephemeral=True)
+
+
+@bot.tree.command(name="amedas", description="最新のアメダス観測値の一覧表を表示します")
+async def amedas_now(interaction: discord.Interaction) -> None:
+    await interaction.response.defer()
+    t = await bot.amedas.latest_time()
+    table, missing = await bot.amedas.build(t)
+    await interaction.followup.send(embed=bot.amedas_embed(t, table, missing))
 
 
 if __name__ == "__main__":
