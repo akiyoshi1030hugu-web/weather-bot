@@ -32,7 +32,9 @@ GUILD_ID = int(os.environ["GUILD_ID"])
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "10"))
 POST_ON_FIRST_RUN = os.getenv("POST_ON_FIRST_RUN", "0") == "1"
 STATE_PATH = Path(os.getenv("DATA_DIR", "./data")) / "state.json"
+RENDER_ZOOM = float(os.getenv("RENDER_ZOOM", "3.0"))  # PDF→画像の拡大率(2.0で約144dpi、3.0で約216dpi)
 MAX_FILE_BYTES = 9 * 1024 * 1024  # Discordの添付上限(10MB)より少し小さく
+MAX_FILES_PER_MESSAGE = 10        # Discordの1メッセージあたりの添付数上限
 
 
 # ---------- 状態の保存(どこまで投稿したか) ----------
@@ -49,10 +51,12 @@ def save_state(state: dict) -> None:
 
 
 # ---------- PDF → PNG ----------
-def render_pdf(pdf: bytes, pages: int, zoom: float = 2.0) -> list[bytes]:
+def render_pdf(pdf: bytes, pages: int, zoom: float = RENDER_ZOOM) -> list[bytes]:
+    """pages=0 なら全ページを画像化する。10MBを超える場合だけ解像度を下げる。"""
     images = []
     with pymupdf.open(stream=pdf, filetype="pdf") as doc:
-        for i in range(min(pages, doc.page_count)):
+        count = doc.page_count if pages <= 0 else min(pages, doc.page_count)
+        for i in range(count):
             z = zoom
             while True:
                 png = doc[i].get_pixmap(matrix=pymupdf.Matrix(z, z)).tobytes("png")
@@ -61,6 +65,20 @@ def render_pdf(pdf: bytes, pages: int, zoom: float = 2.0) -> list[bytes]:
                 z *= 0.75
             images.append(png)
     return images
+
+
+def make_batches(items: list[tuple[str, bytes]]) -> list[list[tuple[str, bytes]]]:
+    """添付を「10個以内・合計9MB以内」のまとまりに分ける。"""
+    batches, current, size = [], [], 0
+    for name, data in items:
+        if current and (len(current) >= MAX_FILES_PER_MESSAGE or size + len(data) > MAX_FILE_BYTES):
+            batches.append(current)
+            current, size = [], 0
+        current.append((name, data))
+        size += len(data)
+    if current:
+        batches.append(current)
+    return batches
 
 
 def to_jst_text(http_date: str | None) -> str:
@@ -169,25 +187,33 @@ class WeatherBot(discord.Client):
         pdf = await self.get_bytes(src.url)
         images = await asyncio.to_thread(render_pdf, pdf, src.pages)
 
-        embed = discord.Embed(title=src.title, url=src.page_url, description=src.note,
+        description = src.note
+        if len(images) > 1:
+            description += f"\n全{len(images)}ページ"
+        embed = discord.Embed(title=src.title, url=src.page_url, description=description,
                               color=0x2B6CB0)
         embed.add_field(name="出典", value="気象庁", inline=True)
         embed.add_field(name="公開ファイル更新", value=to_jst_text(last_modified), inline=True)
         embed.set_footer(text=f"検知 {now_jst_text()}|図中の時刻はUTC(JST=UTC+9)")
         embed.set_image(url="attachment://page1.png")
 
-        files = [discord.File(io.BytesIO(img), filename=f"page{i + 1}.png")
-                 for i, img in enumerate(images)]
+        items = [(f"page{i + 1}.png", img) for i, img in enumerate(images)]
         if src.attach_pdf and len(pdf) <= MAX_FILE_BYTES:
-            files.append(discord.File(io.BytesIO(pdf), filename=f"{src.key}.pdf"))
-        try:
-            await channel.send(embed=embed, files=files)
-        except discord.HTTPException as e:
-            if e.status != 413:
-                raise
-            # 添付が大きすぎる場合は1ページ目だけにする
-            await channel.send(embed=embed,
-                               file=discord.File(io.BytesIO(images[0]), filename="page1.png"))
+            items.append((f"{src.key}.pdf", pdf))
+        batches = make_batches(items)
+        for n, batch in enumerate(batches):
+            kwargs = {"embed": embed} if n == 0 else {
+                "content": f"{src.title}(続き {n + 1}/{len(batches)})"}
+            try:
+                await channel.send(files=[discord.File(io.BytesIO(d), filename=nm)
+                                          for nm, d in batch], **kwargs)
+            except discord.HTTPException as e:
+                if e.status != 413 or len(batch) == 1:
+                    raise
+                # まとめて送れない場合は1枚ずつ送る
+                for i, (nm, d) in enumerate(batch):
+                    await channel.send(file=discord.File(io.BytesIO(d), filename=nm),
+                                       **(kwargs if i == 0 else {}))
         self.state[src.key] = fp
         return "✅ 投稿しました"
 
