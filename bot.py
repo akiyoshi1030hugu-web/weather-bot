@@ -89,7 +89,13 @@ class WeatherBot(discord.Client):
         )
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
+        try:
+            await self.tree.sync(guild=guild)
+        except discord.Forbidden:
+            log.error(
+                "スラッシュコマンドを登録できません(403 Missing Access)。"
+                "GUILD_ID=%s が正しいサーバーIDか、Botが 'bot' と 'applications.commands' "
+                "の両方のスコープで招待されているか確認してください。", GUILD_ID)
         self.poll.start()
 
     async def close(self) -> None:
