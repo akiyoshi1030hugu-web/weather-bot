@@ -2,3 +2,4 @@ discord.py>=2.4
 aiohttp>=3.9
 pymupdf>=1.24
 python-dotenv>=1.0
+Pillow>=10.1
