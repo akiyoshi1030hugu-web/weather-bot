@@ -15,6 +15,7 @@ import pymupdf
 from discord import app_commands
 from discord.ext import tasks
 
+from mode import Mode, ModeWatcher
 from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
 from sources import ASAS, CHANNEL_LAYOUT, PDF_SOURCES, USER_AGENT, PdfSource
 
@@ -32,7 +33,6 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "10"))
 POST_ON_FIRST_RUN = os.getenv("POST_ON_FIRST_RUN", "0") == "1"
-IMAGE_INTERVAL_MINUTES = int(os.getenv("IMAGE_INTERVAL_MINUTES", "60"))  # 画像系の投稿間隔
 STATE_PATH = Path(os.getenv("DATA_DIR", "./data")) / "state.json"
 RENDER_ZOOM = float(os.getenv("RENDER_ZOOM", "3.0"))  # PDF→画像の拡大率(2.0で約144dpi、3.0で約216dpi)
 MAX_FILE_BYTES = 9 * 1024 * 1024  # Discordの添付上限(10MB)より少し小さく
@@ -101,6 +101,7 @@ class WeatherBot(discord.Client):
         self.state = load_state()
         self.session: aiohttp.ClientSession | None = None
         self.composer: TileComposer | None = None
+        self.mode: ModeWatcher | None = None
         self.lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
@@ -109,6 +110,7 @@ class WeatherBot(discord.Client):
             timeout=aiohttp.ClientTimeout(total=90),
         )
         self.composer = TileComposer(self.session)
+        self.mode = ModeWatcher(self.session)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         try:
@@ -159,6 +161,7 @@ class WeatherBot(discord.Client):
                 results.append(await self.safe(src.title + f"({src.note})", self.check_pdf(src)))
                 await asyncio.sleep(2)  # 連続アクセスを避ける
             results.append(await self.safe(ASAS.title, self.check_asas()))
+            results.append(await self.safe("投稿間隔の自動判定", self.update_mode()))
             for product in IMAGE_PRODUCTS:
                 results.append(await self.safe(product.title, self.check_image(product)))
                 await asyncio.sleep(2)
@@ -246,12 +249,34 @@ class WeatherBot(discord.Client):
         self.state[ASAS.key] = filename
         return "✅ 投稿しました"
 
+    # ----- 投稿間隔の自動切り替え -----
+    async def update_mode(self) -> str:
+        mode, changed = await self.mode.evaluate()
+        if changed:
+            await self.announce_mode(mode)
+        return f"{mode.name}モード({mode.interval}分ごと)" + (" ※切り替えました" if changed else "")
+
+    async def announce_mode(self, mode: Mode) -> None:
+        if mode.name == "通常":
+            text = f"🟢 **通常モード**に戻りました。画像は{mode.interval}分ごとに投稿します。"
+        else:
+            icon = "🔴" if mode.name == "大雨監視" else "🌀"
+            text = (f"{icon} **{mode.name}モード**に切り替えました。"
+                    f"画像を{mode.interval}分ごとに投稿します。\n理由:{mode.reason}\n"
+                    "(出典:気象庁 アメダス・台風情報)")
+        targets = {"気象レーダー"}
+        if "台風" in mode.name or "台風" in (self.mode.previous_name or ""):
+            targets.add("台風")
+        for name in targets:
+            if channel := self.find_channel(name):
+                await channel.send(text)
+
     # ----- 画像系(ひまわり・レーダー・解析雨量) -----
     async def check_image(self, product: ImageProduct, force: bool = False) -> str:
         async with self.session.get(product.times_url) as r:
             r.raise_for_status()
             entries = await r.json(content_type=None)
-        entry = pick_latest(entries, product.element, 1 if force else IMAGE_INTERVAL_MINUTES)
+        entry = pick_latest(entries, product.element, 1 if force else self.mode.current.interval)
         if entry is None:
             return "対象時刻のデータがまだありません"
         vt = entry["validtime"]
@@ -317,6 +342,14 @@ async def latest_images(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     results = [await bot.safe(p.title, bot.check_image(p, force=True)) for p in IMAGE_PRODUCTS]
     await interaction.followup.send("\n".join(results), ephemeral=True)
+
+
+@bot.tree.command(name="mode", description="現在の投稿モードと、その理由を表示します")
+async def show_mode(interaction: discord.Interaction) -> None:
+    m = bot.mode.current
+    reason = f"\n理由:{m.reason}" if m.reason else ""
+    await interaction.response.send_message(
+        f"現在は **{m.name}モード**(画像は{m.interval}分ごと)です。{reason}", ephemeral=True)
 
 
 if __name__ == "__main__":
