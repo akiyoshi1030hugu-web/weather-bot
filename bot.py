@@ -5,7 +5,7 @@ import io
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -17,6 +17,7 @@ from discord.ext import tasks
 
 from amedas import AmedasTable
 from mode import Mode, ModeWatcher
+from note import CHECKLIST, NOTE_DEADLINE_HOUR, NOTE_STATION, NoteManager
 from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
 from sources import CHANNEL_LAYOUT, PDF_SOURCES, USER_AGENT, WEATHER_MAPS, AsasSource, PdfSource
 
@@ -104,6 +105,7 @@ class WeatherBot(discord.Client):
         self.composer: TileComposer | None = None
         self.mode: ModeWatcher | None = None
         self.amedas: AmedasTable | None = None
+        self.notes: NoteManager | None = None
         self.lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
@@ -114,6 +116,7 @@ class WeatherBot(discord.Client):
         self.composer = TileComposer(self.session)
         self.mode = ModeWatcher(self.session)
         self.amedas = AmedasTable(self.session)
+        self.notes = NoteManager(self.session, self.state)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         try:
@@ -166,6 +169,7 @@ class WeatherBot(discord.Client):
             for wm in WEATHER_MAPS:
                 results.append(await self.safe(wm.title, self.check_weather_map(wm)))
             results.append(await self.safe("アメダス一覧表", self.check_amedas()))
+            results.append(await self.safe("予報ノート", self.check_note()))
             results.append(await self.safe("投稿間隔の自動判定", self.update_mode()))
             for product in IMAGE_PRODUCTS:
                 results.append(await self.safe(product.title, self.check_image(product)))
@@ -209,6 +213,8 @@ class WeatherBot(discord.Client):
                               color=0x2B6CB0)
         embed.add_field(name="出典", value="気象庁", inline=True)
         embed.add_field(name="公開ファイル更新", value=to_jst_text(last_modified), inline=True)
+        if src.hint:
+            embed.add_field(name="見るポイント", value=src.hint, inline=False)
         embed.set_footer(text=f"検知 {now_jst_text()}|図中の時刻はUTC(JST=UTC+9)")
         embed.set_image(url="attachment://page1.png")
 
@@ -253,6 +259,8 @@ class WeatherBot(discord.Client):
                               description=src.note or None)
         embed.add_field(name="出典", value="気象庁", inline=True)
         embed.add_field(name="ファイル", value=filename, inline=True)
+        if src.hint:
+            embed.add_field(name="見るポイント", value=src.hint, inline=False)
         embed.set_footer(text=f"検知 {now_jst_text()}|図中の時刻はUTC(JST=UTC+9)")
         embed.set_image(url=f"attachment://{src.key}.png")
         await channel.send(embed=embed,
@@ -287,6 +295,53 @@ class WeatherBot(discord.Client):
         await channel.send(embed=self.amedas_embed(t, table, missing))
         self.state["amedas"] = t.isoformat()
         return "✅ 投稿しました"
+
+    # ----- 予報ノート -----
+    async def note_thread(self, key: str):
+        note = self.notes.notes.get(key, {})
+        thread_id = note.get("thread_id")
+        if not thread_id:
+            return None
+        try:
+            return self.get_channel(thread_id) or await self.fetch_channel(thread_id)
+        except discord.HTTPException:
+            return None
+
+    async def check_note(self) -> str:
+        now = self.notes.now()
+        messages = []
+        if self.notes.should_create(now):
+            channel = self.find_channel("予報ノート")
+            if channel is None:
+                return "#予報ノート が見つかりません(/setup_weather を実行)"
+            key = now.date().isoformat()
+            head = await channel.send(
+                f"📝 **{now:%m/%d}の予報ノート**\n今日の **{NOTE_STATION}の最高気温** と **降水の有無(1mm以上)** を予想しましょう。"
+                f"\n提出は `/yoso`、締切は **{NOTE_DEADLINE_HOUR}時** です。")
+            thread = await head.create_thread(name=f"{now:%m/%d} 予報ノート",
+                                              auto_archive_duration=1440)
+            await thread.send(CHECKLIST)
+            self.notes.notes[key] = {"station": NOTE_STATION, "thread_id": thread.id,
+                                     "predictions": {}, "scored": False}
+            messages.append("今日のスレッドを作成しました")
+
+        for key in self.notes.due_for_scoring(now):
+            try:
+                header, lines = await self.notes.grade(key)
+            except RuntimeError as e:
+                if now.date() - date.fromisoformat(key) > timedelta(days=3):
+                    self.notes.notes[key]["scored"] = True
+                    messages.append(f"{key}:データ不足のため採点を中止しました")
+                else:
+                    messages.append(f"{key}:採点待ち({e})")
+                continue
+            text = header + "\n\n" + ("\n".join(lines) if lines else "この日の予想の提出はありませんでした。")
+            target = await self.note_thread(key) or self.find_channel("予報ノート")
+            if target:
+                await target.send(text[:1990])
+            messages.append(f"{key}を採点しました")
+        self.notes.prune()
+        return "、".join(messages) if messages else "待機中"
 
     # ----- 投稿間隔の自動切り替え -----
     async def update_mode(self) -> str:
@@ -397,6 +452,30 @@ async def amedas_now(interaction: discord.Interaction) -> None:
     t = await bot.amedas.latest_time()
     table, missing = await bot.amedas.build(t)
     await interaction.followup.send(embed=bot.amedas_embed(t, table, missing))
+
+
+@bot.tree.command(name="yoso", description="今日の予報ノートに予想を提出します")
+@app_commands.rename(max_temp="最高気温", rain="降水", memo="メモ")
+@app_commands.describe(max_temp="今日の最高気温の予想(℃)", rain="1mm以上の降水があるか",
+                       memo="予想の根拠など(任意)")
+@app_commands.choices(rain=[app_commands.Choice(name="あり", value=1),
+                            app_commands.Choice(name="なし", value=0)])
+async def yoso(interaction: discord.Interaction, max_temp: float,
+               rain: app_commands.Choice[int], memo: str = "") -> None:
+    reply = bot.notes.submit(interaction.user.id, interaction.user.display_name,
+                             max_temp, bool(rain.value), memo)
+    save_state(bot.state)
+    await interaction.response.send_message(reply, ephemeral=True)
+    if reply.startswith("受け付けました"):
+        thread = await bot.note_thread(bot.notes.now().date().isoformat())
+        if thread:
+            await thread.send(f"✏️ {interaction.user.display_name}さんが予想を提出しました(内容は採点時に公開)")
+
+
+@bot.tree.command(name="score", description="予報ノートの自分の成績を表示します")
+async def show_score(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(bot.notes.summary(str(interaction.user.id)),
+                                            ephemeral=True)
 
 
 if __name__ == "__main__":
