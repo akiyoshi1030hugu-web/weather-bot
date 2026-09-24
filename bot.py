@@ -15,6 +15,7 @@ import pymupdf
 from discord import app_commands
 from discord.ext import tasks
 
+from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
 from sources import ASAS, CHANNEL_LAYOUT, PDF_SOURCES, USER_AGENT, PdfSource
 
 try:
@@ -31,6 +32,7 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "10"))
 POST_ON_FIRST_RUN = os.getenv("POST_ON_FIRST_RUN", "0") == "1"
+IMAGE_INTERVAL_MINUTES = int(os.getenv("IMAGE_INTERVAL_MINUTES", "60"))  # 画像系の投稿間隔
 STATE_PATH = Path(os.getenv("DATA_DIR", "./data")) / "state.json"
 RENDER_ZOOM = float(os.getenv("RENDER_ZOOM", "3.0"))  # PDF→画像の拡大率(2.0で約144dpi、3.0で約216dpi)
 MAX_FILE_BYTES = 9 * 1024 * 1024  # Discordの添付上限(10MB)より少し小さく
@@ -98,6 +100,7 @@ class WeatherBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.state = load_state()
         self.session: aiohttp.ClientSession | None = None
+        self.composer: TileComposer | None = None
         self.lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
@@ -105,6 +108,7 @@ class WeatherBot(discord.Client):
             headers={"User-Agent": USER_AGENT},
             timeout=aiohttp.ClientTimeout(total=90),
         )
+        self.composer = TileComposer(self.session)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         try:
@@ -155,6 +159,9 @@ class WeatherBot(discord.Client):
                 results.append(await self.safe(src.title + f"({src.note})", self.check_pdf(src)))
                 await asyncio.sleep(2)  # 連続アクセスを避ける
             results.append(await self.safe(ASAS.title, self.check_asas()))
+            for product in IMAGE_PRODUCTS:
+                results.append(await self.safe(product.title, self.check_image(product)))
+                await asyncio.sleep(2)
             save_state(self.state)
             return results
 
@@ -239,6 +246,41 @@ class WeatherBot(discord.Client):
         self.state[ASAS.key] = filename
         return "✅ 投稿しました"
 
+    # ----- 画像系(ひまわり・レーダー・解析雨量) -----
+    async def check_image(self, product: ImageProduct, force: bool = False) -> str:
+        async with self.session.get(product.times_url) as r:
+            r.raise_for_status()
+            entries = await r.json(content_type=None)
+        entry = pick_latest(entries, product.element, 1 if force else IMAGE_INTERVAL_MINUTES)
+        if entry is None:
+            return "対象時刻のデータがまだありません"
+        vt = entry["validtime"]
+        if not force and (msg := self.is_new(product.key, vt)) is not None:
+            return msg
+        channel = self.find_channel(product.channel)
+        if channel is None:
+            return f"#{product.channel} が見つかりません(/setup_weather を実行)"
+
+        images = [await self.composer.render(product, entry, area) for area in product.areas]
+        ext = "jpg" if product.kind == "satellite" else "png"
+        t = parse_utc(vt)
+        embed = discord.Embed(title=product.title, url=product.page_url, color=0x805AD5,
+                              description=product.note)
+        embed.add_field(name="観測時刻",
+                        value=f"{t.astimezone(JST):%Y-%m-%d %H:%M} JST({t:%H:%M} UTC)",
+                        inline=False)
+        embed.add_field(name="範囲", value=" / ".join(a.name for a in product.areas), inline=True)
+        source = "気象庁" if product.kind == "satellite" else "気象庁(降水)・地理院タイル(背景地図)"
+        embed.add_field(name="出典", value=source, inline=True)
+        embed.set_footer(text=f"検知 {now_jst_text()}")
+        embed.set_image(url=f"attachment://{product.key}_1.{ext}")
+        files = [discord.File(io.BytesIO(img), filename=f"{product.key}_{i + 1}.{ext}")
+                 for i, img in enumerate(images)]
+        await channel.send(embed=embed, files=files)
+        if not force:
+            self.state[product.key] = vt
+        return "✅ 投稿しました"
+
 
 bot = WeatherBot()
 
@@ -266,6 +308,14 @@ async def setup_weather(interaction: discord.Interaction) -> None:
 async def check_now(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     results = await bot.check_all()
+    await interaction.followup.send("\n".join(results), ephemeral=True)
+
+
+@bot.tree.command(name="latest_images", description="衛星・レーダー・解析雨量の最新画像を今すぐ投稿します")
+@app_commands.default_permissions(administrator=True)
+async def latest_images(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    results = [await bot.safe(p.title, bot.check_image(p, force=True)) for p in IMAGE_PRODUCTS]
     await interaction.followup.send("\n".join(results), ephemeral=True)
 
 
