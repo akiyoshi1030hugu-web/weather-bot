@@ -3,6 +3,7 @@
 ここに書くのは観測・予報機関(一次情報源)のURLだけにする。
 新しい図を足すときは PDF_SOURCES に1行追加すればよい。
 """
+import os
 from dataclasses import dataclass
 
 USER_AGENT = "KochiUniv-WeatherStudyBot/0.1 (personal study use)"
@@ -28,46 +29,67 @@ PDF_SOURCES = [
     PdfSource(
         key="kaisetsu_tanki",
         title="短期予報解説資料",
-        url="https://www.data.jma.go.jp/fcd/yoho/data/jishin/kaisetsu_tanki_latest.pdf",
+        url="https://www.data.jma.go.jp/yoho/data/jishin/kaisetsu_tanki_latest.pdf",
         channel="短期予報解説資料",
         note="予報官による実況解析と予報の着目点",
-        page_url="https://www.data.jma.go.jp/fcd/yoho/data/jishin/kaisetsu_tanki_latest.pdf",
+        page_url="https://www.data.jma.go.jp/yoho/data/jishin/kaisetsu_tanki_latest.pdf",
         pages=0,  # 全ページ
         attach_pdf=True,
     ),
-    PdfSource(
-        key="aupq35_00",
-        title="AUPQ35 アジア500hPa・300hPa天気図",
-        url=f"{JMA}/bosai/numericmap/data/nwpmap/aupq35_00.pdf",
-        channel="高層天気図",
-        note="00UTC(日本時間9時)観測",
-        page_url=UPPER_PAGE,
-    ),
-    PdfSource(
-        key="aupq35_12",
-        title="AUPQ35 アジア500hPa・300hPa天気図",
-        url=f"{JMA}/bosai/numericmap/data/nwpmap/aupq35_12.pdf",
-        channel="高層天気図",
-        note="12UTC(日本時間21時)観測",
-        page_url=UPPER_PAGE,
-    ),
-    PdfSource(
-        key="aupq78_00",
-        title="AUPQ78 アジア850hPa・700hPa天気図",
-        url=f"{JMA}/bosai/numericmap/data/nwpmap/aupq78_00.pdf",
-        channel="高層天気図",
-        note="00UTC(日本時間9時)観測",
-        page_url=UPPER_PAGE,
-    ),
-    PdfSource(
-        key="aupq78_12",
-        title="AUPQ78 アジア850hPa・700hPa天気図",
-        url=f"{JMA}/bosai/numericmap/data/nwpmap/aupq78_12.pdf",
-        channel="高層天気図",
-        note="12UTC(日本時間21時)観測",
-        page_url=UPPER_PAGE,
-    ),
 ]
+
+# ---------- 高層天気図(解析) ----------
+HINT_UP_500 = ("500hPa:トラフ・リッジの位置と寒気(-30℃以下は大雪・雷の目安)。5880m線は太平洋高気圧の縁の目安。"
+               "300hPa:等風速線でジェット気流の位置と強さを確認")
+HINT_UP_850 = ("850hPa:等温線と風の交わり方で暖気・寒気の移流を読む。"
+               "700hPa:湿数3℃以下の湿った領域が雲の広がりの目安")
+HINT_UP_JET = "ジェット気流(強風軸)の位置と蛇行。ジェットの南側・入口と出口付近は擾乱の発達に関係する"
+UPPER_CHARTS = [
+    # (コード, タイトル, 見るポイント, 投稿先チャンネル)
+    ("aupq35", "AUPQ35 アジア500hPa・300hPa天気図", HINT_UP_500, "500-300hpa解析"),
+    ("aupq78", "AUPQ78 アジア850hPa・700hPa天気図", HINT_UP_850, "850-700hpa解析"),
+    ("aupa20", "AUPA20 アジア200hPa天気図", HINT_UP_JET, "200-250hpaジェット"),
+    ("aupa25", "AUPA25 アジア250hPa天気図", HINT_UP_JET, "200-250hpaジェット"),
+]
+for code, title, hint, channel in UPPER_CHARTS:
+    for hh, jst in (("00", "9"), ("12", "21")):
+        PDF_SOURCES.append(PdfSource(
+            key=f"{code}_{hh}",
+            title=title,
+            url=f"{JMA}/bosai/numericmap/data/nwpmap/{code}_{hh}.pdf",
+            channel=channel,
+            note=f"{hh}UTC(日本時間{jst}時)観測",
+            page_url=UPPER_PAGE,
+            hint=hint,
+        ))
+
+# ---------- 週間・季節予報の解説資料 ----------
+PDF_SOURCES.append(PdfSource(
+    key="kaisetsu_shukan",
+    title="週間天気予報解説資料",
+    url="https://www.data.jma.go.jp/yoho/data/jishin/kaisetsu_shukan_latest.pdf",
+    channel="週間予報解説資料",
+    note="3〜7日先の予報の根拠と、主要なじょう乱の見通し(毎日10時ごろ)",
+    page_url="https://www.data.jma.go.jp/yoho/data/jishin/kaisetsu_shukan_latest.pdf",
+    pages=0,
+    hint="予報期間中の主要じょう乱(低気圧・前線・台風)の動きと、予報の信頼度が低い日を確認",
+))
+# 地方ごとの季節予報解説(地方コードは気象庁の予報区コード)
+SEASON_AREAS = [(c.strip(), n.strip()) for c, n in (
+    item.split(":") for item in os.getenv(
+        "SEASON_AREAS", "010800:四国地方,010900:九州北部地方").split(","))]
+for term, label, when in (("P1M", "1か月予報", "毎週木曜14時30分"),
+                          ("P3M", "3か月予報", "毎月25日ごろ")):
+    for code, name in SEASON_AREAS:
+        PDF_SOURCES.append(PdfSource(
+            key=f"season_{term}_{code}",
+            title=f"{label}の解説({name})",
+            url=f"{JMA}/bosai/season/data/pdf/{term}/{code}.pdf",
+            channel="季節予報",
+            note=f"向こう{label[:-2]}の気温・降水量などの見通し({when}発表)",
+            page_url=f"{JMA}/bosai/season/",
+            pages=0,
+        ))
 
 # ---------- 数値予報天気図(気象庁 数値予報天気図ページで公開されているPDF) ----------
 # 内容の説明は気象庁「配信資料に関する技術情報」の図の定義にもとづく
@@ -140,9 +162,10 @@ WEATHER_MAPS = [
 # /setup_weather で作成するカテゴリーとチャンネル
 CHANNEL_LAYOUT = [
     ("📋 今日の予報", ["短期予報解説資料", "予報ノート", "links"]),
-    ("🗺️ 天気図(実況)", ["地上実況-asas", "高層天気図", "エマグラム"]),
+    ("🗺️ 天気図(実況)", ["地上実況-asas", "850-700hpa解析", "500-300hpa解析", "200-250hpaジェット", "エマグラム"]),
     ("📈 数値予報", ["初期値解析", "地上予想図", "500hpa高度渦度", "850-700hpa気温湿数", "850hpa相当温位"]),
     ("🛰️ 衛星・レーダー", ["ひまわり-赤外", "ひまわり-水蒸気", "気象レーダー", "解析雨量"]),
+    ("📅 週間・季節予報", ["週間予報解説資料", "季節予報"]),
     ("📊 観測データ", ["アメダス"]),
     ("⚠️ 防災", ["警報注意報", "台風"]),
 ]
