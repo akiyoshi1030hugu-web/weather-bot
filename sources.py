@@ -68,6 +68,38 @@ PDF_SOURCES = [
     ),
 ]
 
+# ---------- 数値予報天気図(気象庁 数値予報天気図ページで公開されているPDF) ----------
+# 内容の説明は気象庁「配信資料に関する技術情報」の図の定義にもとづく
+NWP_PAGE = f"{JMA}/bosai/numericmap/#type=nwp"
+NWP_CHARTS = [
+    ("axfe578", "AXFE578 極東 解析図",
+     "500hPa高度・渦度/850hPa気温・風/700hPa鉛直流(初期値の解析)"),
+    ("fxfe502", "FXFE502 極東 12・24時間予想図",
+     "500hPa高度・渦度/地上気圧・降水量・海上風"),
+    ("fxfe5782", "FXFE5782 極東 12・24時間予想図",
+     "500hPa気温/700hPa湿数/850hPa気温・風/700hPa鉛直流"),
+    ("fxjp854", "FXJP854 日本 12〜48時間予想図",
+     "850hPa風・相当温位(12・24・36・48時間後)"),
+    ("fxfe504", "FXFE504 極東 36・48時間予想図",
+     "500hPa高度・渦度/地上気圧・降水量・海上風"),
+    ("fxfe5784", "FXFE5784 極東 36・48時間予想図",
+     "500hPa気温/700hPa湿数/850hPa気温・風/700hPa鉛直流"),
+    ("fxfe507", "FXFE507 極東 72時間予想図",
+     "500hPa高度・渦度/地上気圧・降水量・海上風"),
+    ("fxfe577", "FXFE577 極東 72時間予想図",
+     "500hPa気温/700hPa湿数/850hPa気温・風/700hPa鉛直流"),
+]
+for code, title, desc in NWP_CHARTS:
+    for hh, jst in (("00", "9"), ("12", "21")):
+        PDF_SOURCES.append(PdfSource(
+            key=f"{code}_{hh}",
+            title=title,
+            url=f"{JMA}/bosai/numericmap/data/nwpmap/{code}_{hh}.pdf",
+            channel="数値予報天気図",
+            note=f"{desc}\n{'解析' if code.startswith('a') else '初期'}時刻 {hh}UTC(日本時間{jst}時)",
+            page_url=NWP_PAGE,
+        ))
+
 
 @dataclass(frozen=True)
 class AsasSource:
@@ -77,9 +109,18 @@ class AsasSource:
     image_base: str = f"{JMA}/bosai/weather_map/data/png/"
     channel: str = "地上実況-asas"
     page_url: str = f"{JMA}/bosai/weather_map/"
+    list_key: str = "now"   # 天気図一覧(list.json)の中のどの種類か
+    note: str = ""
 
 
 ASAS = AsasSource()
+WEATHER_MAPS = [
+    ASAS,
+    AsasSource(key="fsas24", title="FSAS24 24時間予想図", channel="数値予報天気図",
+               list_key="ft24", note="地上気圧配置と前線の24時間後の予想"),
+    AsasSource(key="fsas48", title="FSAS48 48時間予想図", channel="数値予報天気図",
+               list_key="ft48", note="地上気圧配置と前線の48時間後の予想"),
+]
 
 # /setup_weather で作成するカテゴリーとチャンネル
 CHANNEL_LAYOUT = [
