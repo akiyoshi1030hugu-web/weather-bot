@@ -269,17 +269,19 @@ class WeatherBot(discord.Client):
         return "✅ 投稿しました"
 
     # ----- アメダス一覧表 -----
-    def amedas_embed(self, t: datetime, table: str, missing: list[str]) -> discord.Embed:
+    def amedas_message(self, t: datetime, image: bytes | None, text: str,
+                       missing: list[str]) -> dict:
         utc = t.astimezone(timezone.utc)
         embed = discord.Embed(title=f"アメダス観測値 {t:%m/%d %H:%M} JST({utc:%H} UTC)",
                               url="https://www.jma.go.jp/bosai/amedas/",
-                              description=f"```\n{table}\n```", color=0xDD6B20)
-        embed.add_field(name="出典", value="気象庁 アメダス(速報値)", inline=True)
-        embed.add_field(name="単位", value="℃・%・hPa・m/s・mm", inline=True)
+                              description=text or None, color=0xDD6B20)
+        embed.set_footer(text="出典:気象庁 アメダス(速報値)")
         if missing:
             embed.add_field(name="見つからなかった地点", value="、".join(missing), inline=False)
-        embed.set_footer(text="―は欠測・未観測・品質確認中|3h変化は3時間前の海面気圧との差")
-        return embed
+        if image is None:
+            return {"embed": embed}
+        embed.set_image(url="attachment://amedas.png")
+        return {"embed": embed, "file": discord.File(io.BytesIO(image), filename="amedas.png")}
 
     async def check_amedas(self) -> str:
         latest = await self.amedas.latest_time()
@@ -291,8 +293,8 @@ class WeatherBot(discord.Client):
         channel = self.find_channel("アメダス")
         if channel is None:
             return "#アメダス が見つかりません(/setup_weather を実行)"
-        table, missing = await self.amedas.build(t)
-        await channel.send(embed=self.amedas_embed(t, table, missing))
+        image, text, missing = await self.amedas.build(t)
+        await channel.send(**self.amedas_message(t, image, text, missing))
         self.state["amedas"] = t.isoformat()
         return "✅ 投稿しました"
 
@@ -450,8 +452,8 @@ async def show_mode(interaction: discord.Interaction) -> None:
 async def amedas_now(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     t = await bot.amedas.latest_time()
-    table, missing = await bot.amedas.build(t)
-    await interaction.followup.send(embed=bot.amedas_embed(t, table, missing))
+    image, text, missing = await bot.amedas.build(t)
+    await interaction.followup.send(**bot.amedas_message(t, image, text, missing))
 
 
 @bot.tree.command(name="yoso", description="今日の予報ノートに予想を提出します")
