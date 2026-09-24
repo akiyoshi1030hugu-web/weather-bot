@@ -17,7 +17,7 @@ from discord.ext import tasks
 
 from mode import Mode, ModeWatcher
 from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
-from sources import ASAS, CHANNEL_LAYOUT, PDF_SOURCES, USER_AGENT, PdfSource
+from sources import CHANNEL_LAYOUT, PDF_SOURCES, USER_AGENT, WEATHER_MAPS, AsasSource, PdfSource
 
 try:
     from dotenv import load_dotenv
@@ -160,7 +160,8 @@ class WeatherBot(discord.Client):
             for src in PDF_SOURCES:
                 results.append(await self.safe(src.title + f"({src.note})", self.check_pdf(src)))
                 await asyncio.sleep(2)  # 連続アクセスを避ける
-            results.append(await self.safe(ASAS.title, self.check_asas()))
+            for wm in WEATHER_MAPS:
+                results.append(await self.safe(wm.title, self.check_weather_map(wm)))
             results.append(await self.safe("投稿間隔の自動判定", self.update_mode()))
             for product in IMAGE_PRODUCTS:
                 results.append(await self.safe(product.title, self.check_image(product)))
@@ -228,25 +229,31 @@ class WeatherBot(discord.Client):
         return "✅ 投稿しました"
 
     # ----- 地上実況天気図 -----
-    async def check_asas(self) -> str:
-        async with self.session.get(ASAS.list_url) as r:
+    async def check_weather_map(self, src: AsasSource) -> str:
+        async with self.session.get(src.list_url) as r:
             r.raise_for_status()
             data = await r.json(content_type=None)
-        filename = data["near"]["now"][-1]
-        if (msg := self.is_new(ASAS.key, filename)) is not None:
+        files = data.get("near", {}).get(src.list_key)
+        if not files:
+            keys = ", ".join(data.get("near", {}).keys())
+            return f"天気図一覧に '{src.list_key}' がありません(ある種類: {keys})"
+        filename = files[-1]
+        if (msg := self.is_new(src.key, filename)) is not None:
             return msg
-        channel = self.find_channel(ASAS.channel)
+        channel = self.find_channel(src.channel)
         if channel is None:
-            return f"#{ASAS.channel} が見つかりません(/setup_weather を実行)"
+            return f"#{src.channel} が見つかりません(/setup_weather を実行)"
 
-        png = await self.get_bytes(ASAS.image_base + filename)
-        embed = discord.Embed(title=ASAS.title, url=ASAS.page_url, color=0x2F855A)
+        png = await self.get_bytes(src.image_base + filename)
+        embed = discord.Embed(title=src.title, url=src.page_url, color=0x2F855A,
+                              description=src.note or None)
         embed.add_field(name="出典", value="気象庁", inline=True)
         embed.add_field(name="ファイル", value=filename, inline=True)
         embed.set_footer(text=f"検知 {now_jst_text()}|図中の時刻はUTC(JST=UTC+9)")
-        embed.set_image(url="attachment://asas.png")
-        await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename="asas.png"))
-        self.state[ASAS.key] = filename
+        embed.set_image(url=f"attachment://{src.key}.png")
+        await channel.send(embed=embed,
+                           file=discord.File(io.BytesIO(png), filename=f"{src.key}.png"))
+        self.state[src.key] = filename
         return "✅ 投稿しました"
 
     # ----- 投稿間隔の自動切り替え -----
