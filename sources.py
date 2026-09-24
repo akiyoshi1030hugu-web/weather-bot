@@ -16,7 +16,7 @@ class PdfSource:
     channel: str        # 投稿先チャンネル名
     note: str           # 観測・初期時刻などの説明
     page_url: str       # 元ページ(人が開く用)
-    pages: int = 1      # 画像化するページ数
+    pages: int = 1      # 画像化するページ数(0なら全ページ)
     attach_pdf: bool = False  # PDF本体も添付するか
 
 
@@ -31,7 +31,7 @@ PDF_SOURCES = [
         channel="短期予報解説資料",
         note="予報官による実況解析と予報の着目点",
         page_url="https://www.data.jma.go.jp/fcd/yoho/data/jishin/kaisetsu_tanki_latest.pdf",
-        pages=2,
+        pages=0,  # 全ページ
         attach_pdf=True,
     ),
     PdfSource(
