@@ -17,7 +17,11 @@ NOTE_HOUR = int(os.getenv("NOTE_HOUR", "7"))               # スレッドを作�
 NOTE_DEADLINE_HOUR = int(os.getenv("NOTE_DEADLINE_HOUR", "12"))  # 予想の締切
 SCORE_HOUR = int(os.getenv("SCORE_HOUR", "1"))             # 翌日のこの時刻に採点
 NOTE_STATION = os.getenv("NOTE_STATION", "高知")
+NOTE_OFFICE = os.getenv("NOTE_OFFICE", "390000")     # 気象庁の予報を取る府県予報区(390000=高知県)
+NOTE_POP_AREA = os.getenv("NOTE_POP_AREA", "")       # 降水確率の地域コード(空欄なら府県内の最初の地域)
 RAIN_THRESHOLD_MM = 1.0
+JMA_RAIN_POP = 50  # 気象庁の降水確率がこの値(%)以上の時間帯があれば「降水あり」の予報とみなす
+JMA_ID = "jma"
 
 CHECKLIST = """**今日のチェック項目**(スレッドに自由に書き込んでください)
 1. 地上天気図:高気圧・低気圧・前線の位置と、今後の動き
@@ -135,6 +139,37 @@ class NoteManager:
             raise RuntimeError(f"{day} の観測データがそろっていません({count}/144)")
         return max(temps), rain
 
+    # ---------- 気象庁の予報 ----------
+    async def jma_forecast(self, day: date) -> dict:
+        """その日の気象庁の予報(最高気温・降水確率の最大)を取得する。"""
+        sid = await self.resolve_station()
+        data = await self._json(f"{JMA}/bosai/forecast/data/forecast/{NOTE_OFFICE}.json")
+        short = data[0]
+        temp, pops = None, []
+        for ts in short["timeSeries"]:
+            times = [datetime.fromisoformat(t) for t in ts["timeDefines"]]
+            for area in ts["areas"]:
+                code = area["area"]["code"]
+                if "temps" in area and code == sid:
+                    for t, v in zip(times, area["temps"]):
+                        if t.date() == day and t.hour == 9 and v != "":  # 9時の値=日中の最高気温
+                            temp = float(v)
+                if "pops" in area and (code == NOTE_POP_AREA or (not NOTE_POP_AREA and not pops)):
+                    pops = [int(v) for t, v in zip(times, area["pops"]) if t.date() == day and v != ""]
+        if temp is None and len(data) > 1:  # 短期予報に無ければ週間予報の最高気温を使う
+            for ts in data[1]["timeSeries"]:
+                times = [datetime.fromisoformat(t) for t in ts["timeDefines"]]
+                for area in ts["areas"]:
+                    if area["area"]["code"] == sid and "tempsMax" in area:
+                        for t, v in zip(times, area["tempsMax"]):
+                            if t.date() == day and v != "":
+                                temp = float(v)
+        if temp is None:
+            raise RuntimeError("気象庁の予報から最高気温を読み取れませんでした")
+        pop = max(pops) if pops else None
+        return {"temp": temp, "pop": pop, "rain": pop is not None and pop >= JMA_RAIN_POP,
+                "report": short.get("reportDatetime", "")}
+
     # ---------- 採点 ----------
     async def grade(self, key: str) -> tuple[str, list[str]]:
         """採点して、結果の文章と、点数の一覧を返す。"""
@@ -142,12 +177,26 @@ class NoteManager:
         day = date.fromisoformat(key)
         obs_temp, obs_rain_mm = await self.observed(day)
         obs_rain = obs_rain_mm >= RAIN_THRESHOLD_MM
-        lines = []
+        lines, graded = [], {}
+        jma = note.get("jma")
+        jma_pt = None
+        if jma:
+            jma_pt, detail = score(jma["temp"], jma["rain"], obs_temp, obs_rain)
+            report = datetime.fromisoformat(jma["report"]).strftime("%H時") if jma.get("report") else ""
+            pop = f"降水確率最大{jma['pop']}%" if jma.get("pop") is not None else "降水確率なし"
+            lines.append(f"🏛️ **気象庁**({report}発表):予想 {jma['temp']:.1f}℃・{pop}→{'あり' if jma['rain'] else 'なし'}"
+                         f" → **{jma_pt}点**({detail})")
+            graded[JMA_ID] = self._grade_row("気象庁", jma["temp"], jma["rain"], obs_temp, obs_rain, jma_pt)
         for uid, p in sorted(note["predictions"].items(), key=lambda x: x[1]["submitted"]):
             pt, detail = score(p["temp"], p["rain"], obs_temp, obs_rain)
+            versus = ""
+            if jma_pt is not None:
+                versus = " 🏆気象庁に勝ち" if pt > jma_pt else " 🤝引き分け" if pt == jma_pt else " 気象庁の勝ち"
             lines.append(f"**{p['name']}**:予想 {p['temp']:.1f}℃・{'あり' if p['rain'] else 'なし'}"
-                         f" → **{pt}点**({detail})")
+                         f" → **{pt}点**({detail}){versus}")
             self._record(uid, p["name"], key, pt, abs(p["temp"] - obs_temp))
+            graded[uid] = self._grade_row(p["name"], p["temp"], p["rain"], obs_temp, obs_rain, pt)
+        note["graded"] = graded
         header = (f"**{day:%m/%d}の結果({note['station']})**\n"
                   f"実測:最高気温 **{obs_temp:.1f}℃**/降水量 {obs_rain_mm:.1f}mm"
                   f"(降水{'あり' if obs_rain else 'なし'})\n"
@@ -155,6 +204,62 @@ class NoteManager:
         note["scored"] = True
         note["result"] = {"temp": obs_temp, "rain_mm": obs_rain_mm}
         return header, lines
+
+    @staticmethod
+    def _grade_row(name, temp, rain, obs_temp, obs_rain, pt) -> dict:
+        return {"name": name, "pt": pt, "err": round(temp - obs_temp, 1),
+                "pred_rain": rain, "obs_rain": obs_rain}
+
+    # ---------- 月間の検証 ----------
+    def monthly(self, year: int, month: int) -> str | None:
+        """その月の成績を、気象庁と比べた検証表にする。"""
+        prefix = f"{year:04d}-{month:02d}"
+        rows: dict[str, list[dict]] = {}
+        jma_by_day: dict[str, dict] = {}
+        for key, note in sorted(self.notes.items()):
+            if not key.startswith(prefix) or "graded" not in note:
+                continue
+            for uid, g in note["graded"].items():
+                rows.setdefault(uid, []).append(g | {"day": key})
+            if JMA_ID in note["graded"]:
+                jma_by_day[key] = note["graded"][JMA_ID]
+        if not rows:
+            return None
+        from amedas import display_width, pad
+
+        def cut(text: str, width: int) -> str:
+            while display_width(text) > width:
+                text = text[:-1]
+            return text
+
+        heads = [("参加者", 12, False), ("日数", 5, True), ("平均点", 7, True), ("気温誤差", 9, True),
+                 ("RMSE", 7, True), ("降水的中", 9, True), ("見逃し", 7, True), ("空振り", 7, True),
+                 ("対気象庁", 12, True)]
+        lines = [f"📊 **{year}年{month}月の予報検証({NOTE_STATION})**", "```"]
+        lines.append("".join(pad(h, w, r) for h, w, r in heads))
+        order = [JMA_ID] + [u for u in rows if u != JMA_ID] if JMA_ID in rows else list(rows)
+        for uid in order:
+            gs = rows[uid]
+            n = len(gs)
+            mae = sum(abs(g["err"]) for g in gs) / n
+            rmse = (sum(g["err"] ** 2 for g in gs) / n) ** 0.5
+            hit = sum(g["pred_rain"] == g["obs_rain"] for g in gs) / n * 100
+            miss = sum(g["obs_rain"] and not g["pred_rain"] for g in gs)
+            false = sum(g["pred_rain"] and not g["obs_rain"] for g in gs)
+            vs = "―"
+            if uid != JMA_ID:
+                pairs = [(g["pt"], jma_by_day[g["day"]]["pt"]) for g in gs if g["day"] in jma_by_day]
+                if pairs:
+                    w = sum(a > b for a, b in pairs)
+                    l = sum(a < b for a, b in pairs)
+                    vs = f"{w}勝{l}敗{len(pairs) - w - l}分"
+            cells = [cut(gs[-1]["name"], 11), str(n), f"{sum(g['pt'] for g in gs) / n:.1f}",
+                     f"{mae:.1f}℃", f"{rmse:.1f}℃", f"{hit:.0f}%", str(miss), str(false), vs]
+            lines.append("".join(pad(c, w, r) for c, (_, w, r) in zip(cells, heads)))
+        lines.append("```")
+        lines.append("気温誤差:最高気温の誤差の大きさの平均/RMSE:大きく外した日ほど重く数える誤差/"
+                     "見逃し:降水なしと予想して降った日/空振り:降水ありと予想して降らなかった日")
+        return "\n".join(lines)
 
     def _record(self, uid: str, name: str, key: str, pt: int, err: float) -> None:
         s = self.state["scores"].setdefault(uid, {
@@ -174,7 +279,7 @@ class NoteManager:
         return (f"**{s['name']}さんの成績**\n累計 {s['total']}点({s['count']}回、1回平均 {s['total'] / s['count']:.1f}点)\n"
                 f"最高気温の平均誤差 {avg:.1f}℃\n連続提出 {s['streak']}日(最長 {s['best_streak']}日)")
 
-    def prune(self, keep_days: int = 30) -> None:
+    def prune(self, keep_days: int = 45) -> None:
         limit = (self.now().date() - timedelta(days=keep_days)).isoformat()
         for key in [k for k in self.notes if k < limit and self.notes[k].get("scored")]:
             del self.notes[key]
