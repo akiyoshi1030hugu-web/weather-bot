@@ -17,10 +17,11 @@ from discord import app_commands
 from discord.ext import tasks
 
 from amedas import AmedasTable
+from archive import ARCHIVE_CHANNEL, REVIEW, CaseArchive
 from emagram import EMAGRAM_POINTS, PAGE_URL as EMAGRAM_PAGE, SUMMARY_CHANNEL, Emagram, channel_for
 from emagram_summary import render_summary
 from mode import Mode, ModeWatcher
-from note import CHECKLIST, NOTE_DEADLINE_HOUR, NOTE_STATION, NoteManager
+from note import CHECKLIST, NOTE_DEADLINE_HOUR, NOTE_STATION, SCORE_HOUR, NoteManager
 from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
 from sources import CHANNEL_LAYOUT, PDF_SOURCES, USER_AGENT, WEATHER_MAPS, AsasSource, PdfSource
 
@@ -39,6 +40,15 @@ GUILD_ID = int(os.environ["GUILD_ID"])
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "10"))
 POST_ON_FIRST_RUN = os.getenv("POST_ON_FIRST_RUN", "0") == "1"
 HISTORY_LIMIT = 30  # 再送防止のために確認する最近の投稿数
+NWP_DIR = Path(os.getenv("DATA_DIR", "./data")) / "nwp"   # 答え合わせ用に予想図を保存する場所
+VERIFY_CODES = {"axfe578", "fxfe502", "fxfe5782"}
+VERIFY_CHANNEL = "予報の答え合わせ"
+VERIFY_QUESTIONS = """**答え合わせのポイント**(このスレッドに書き込んでください)
+1. 500hPaのトラフ(渦度の極大域)は、予想より東・西どちらにずれたか。進む速さは?
+2. 850hPaの暖気・寒気の張り出し(等温線の位置)は予想どおりか
+3. 700hPaの上昇流域は、予想と比べてどこにずれたか
+4. 地上の低気圧・前線は #地上実況-asas の実況図と比べて、予想より深い?浅い?位置は?
+5. ずれた原因として考えられること(上流が観測の少ない海上だった、など)"""
 STATE_PATH = Path(os.getenv("DATA_DIR", "./data")) / "state.json"
 RENDER_ZOOM = float(os.getenv("RENDER_ZOOM", "3.0"))  # PDF→画像の拡大率(2.0で約144dpi、3.0で約216dpi)
 MAX_FILE_BYTES = 9 * 1024 * 1024  # Discordの添付上限(10MB)より少し小さく
@@ -132,6 +142,7 @@ class WeatherBot(discord.Client):
         self.mode = ModeWatcher(self.session)
         self.amedas = AmedasTable(self.session)
         self.notes = NoteManager(self.session, self.state)
+        self.cases = CaseArchive(self.state)
         self.emagram = Emagram(self.session, self.state, self.emagram_font)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
@@ -223,6 +234,18 @@ class WeatherBot(discord.Client):
             return "投稿済み(チャンネルで確認したので再送しません)"
         return None
 
+    async def archive_post(self, message, label: str) -> None:
+        """事例の記録中なら、投稿へのリンクを事例スレッドに追加する。"""
+        if message is None or not self.cases.wants(getattr(message.channel, "name", "")):
+            return
+        ev = self.cases.event
+        try:
+            thread = self.get_channel(ev["thread_id"]) or await self.fetch_channel(ev["thread_id"])
+            await thread.send(f"🔗 {label}({now_jst_text()}) {message.jump_url}")
+            ev["count"] += 1
+        except discord.HTTPException:
+            log.exception("事例スレッドへの追加に失敗しました")
+
     def is_new(self, key: str, value: str) -> str | None:
         """新着ならNone、そうでなければ結果メッセージを返す。"""
         prev = self.state.get(key)
@@ -268,22 +291,86 @@ class WeatherBot(discord.Client):
         if src.attach_pdf and len(pdf) <= MAX_FILE_BYTES:
             items.append((f"{mark}.pdf", pdf))
         batches = make_batches(items)
+        first = None
         for n, batch in enumerate(batches):
             kwargs = {"embed": embed} if n == 0 else {
                 "content": f"{src.title}(続き {n + 1}/{len(batches)})"}
             try:
-                await channel.send(files=[discord.File(io.BytesIO(d), filename=nm)
-                                          for nm, d in batch], **kwargs)
+                sent = await channel.send(files=[discord.File(io.BytesIO(d), filename=nm)
+                                                 for nm, d in batch], **kwargs)
+                first = first or sent
             except discord.HTTPException as e:
                 if e.status != 413 or len(batch) == 1:
                     raise
                 # まとめて送れない場合は1枚ずつ送る
                 for i, (nm, d) in enumerate(batch):
-                    await channel.send(file=discord.File(io.BytesIO(d), filename=nm),
-                                       **(kwargs if i == 0 else {}))
+                    sent = await channel.send(file=discord.File(io.BytesIO(d), filename=nm),
+                                              **(kwargs if i == 0 else {}))
+                    first = first or sent
         self.state[src.key] = fp
         self.state[f"{src.key}:sha256"] = digest
-        return "✅ 投稿しました"
+        await self.archive_post(first, f"{src.title}({src.note.splitlines()[-1]})")
+        extra = await self.keep_for_verification(src.key, last_modified, images[0])
+        return "✅ 投稿しました" + (f"/{extra}" if extra else "")
+
+    # ----- 数値予報の答え合わせ -----
+    @staticmethod
+    def nwp_init_time(last_modified: str | None, hh: int) -> datetime:
+        """ファイルの更新時刻から、その図の初期時刻(UTC)を求める。"""
+        lm = parsedate_to_datetime(last_modified) if last_modified else datetime.now(timezone.utc)
+        lm = lm.astimezone(timezone.utc)
+        t = lm.replace(hour=hh, minute=0, second=0, microsecond=0)
+        return t - timedelta(days=1) if t > lm else t
+
+    async def keep_for_verification(self, key: str, last_modified: str | None, png: bytes) -> str:
+        code, _, hh = key.rpartition("_")
+        if code not in VERIFY_CODES or not hh.isdigit():
+            return ""
+        init = self.nwp_init_time(last_modified, int(hh))
+        NWP_DIR.mkdir(parents=True, exist_ok=True)
+        (NWP_DIR / f"{code}_{init:%Y%m%d%H}.png").write_bytes(png)
+        limit = f"{init - timedelta(days=4):%Y%m%d%H}"
+        for old in NWP_DIR.glob("*.png"):  # 4日より前のものは消す
+            if old.stem.rpartition("_")[2] < limit:
+                old.unlink(missing_ok=True)
+        if code == "axfe578":
+            return await self.post_verification(init)
+        return ""
+
+    async def post_verification(self, valid: datetime) -> str:
+        """24時間前の初期値の予想図と、同じ時刻の解析図を並べて投稿する。"""
+        channel = self.find_channel(VERIFY_CHANNEL)
+        if channel is None:
+            return f"#{VERIFY_CHANNEL} が見つかりません(/setup_weather を実行)"
+        fc = valid - timedelta(hours=24)
+        paths = {c: NWP_DIR / f"{c}_{(valid if c == 'axfe578' else fc):%Y%m%d%H}.png" for c in VERIFY_CODES}
+        if not all(p.exists() for p in paths.values()):
+            return "答え合わせ:24時間前の予想図がまだ保存されていません(保存が始まった翌日から投稿)"
+        if (msg := await self.skip_if_posted(channel, "verify", valid.isoformat())) is not None:
+            return "答え合わせ:" + msg
+        mark = self.marker("verify", valid.isoformat())
+        v, f = valid.astimezone(JST), fc.astimezone(JST)
+        embed = discord.Embed(
+            title=f"数値予報の答え合わせ {v:%m/%d %H時} JST({valid:%H}UTC)", color=0x6B46C1,
+            url="https://www.jma.go.jp/bosai/numericmap/#type=nwp",
+            description=f"**① 予想**:{f:%m/%d %H時}初期値のFXFE502・FXFE5782\n"
+                        "　→ 図の中の **T=24(24時間後)** の面を見てください\n"
+                        f"**② 実況**:{v:%m/%d %H時}の解析図AXFE578(次の投稿)")
+        embed.add_field(name="出典", value="気象庁 数値予報天気図", inline=False)
+        embed.set_image(url=f"attachment://{mark}-fxfe502.png")
+        pred = [("fxfe502", paths["fxfe502"]), ("fxfe5782", paths["fxfe5782"])]
+        files = [discord.File(p, filename=f"{mark}-{c}.png") for c, p in pred]
+        if sum(p.stat().st_size for _, p in pred) <= MAX_FILE_BYTES:
+            head = await channel.send(embed=embed, files=files)
+        else:
+            head = await channel.send(embed=embed, file=files[0])
+            await channel.send(file=files[1])
+        await channel.send(content=f"**② 実況**:AXFE578 解析図({v:%m/%d %H時})",
+                           file=discord.File(paths["axfe578"], filename=f"{mark}-axfe578.png"))
+        thread = await head.create_thread(name=f"{v:%m/%d %H時} 答え合わせ", auto_archive_duration=1440)
+        await thread.send(VERIFY_QUESTIONS)
+        await self.archive_post(head, "数値予報の答え合わせ")
+        return "答え合わせを投稿しました"
 
     # ----- 地上実況天気図 -----
     async def check_weather_map(self, src: AsasSource) -> str:
@@ -313,8 +400,9 @@ class WeatherBot(discord.Client):
             embed.add_field(name="見るポイント", value=src.hint, inline=False)
         embed.set_footer(text=f"検知 {now_jst_text()}|図中の時刻はUTC(JST=UTC+9)")
         embed.set_image(url=f"attachment://{mark}.png")
-        await channel.send(embed=embed,
-                           file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
+        sent = await channel.send(embed=embed,
+                                  file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
+        await self.archive_post(sent, src.title)
         self.state[src.key] = filename
         return "✅ 投稿しました"
 
@@ -346,8 +434,9 @@ class WeatherBot(discord.Client):
         if (msg := await self.skip_if_posted(channel, "amedas", t.isoformat())) is not None:
             return msg
         image, text, missing = await self.amedas.build(t)
-        await channel.send(**self.amedas_message(t, image, text, missing,
-                                                 self.marker("amedas", t.isoformat())))
+        sent = await channel.send(**self.amedas_message(t, image, text, missing,
+                                                        self.marker("amedas", t.isoformat())))
+        await self.archive_post(sent, f"アメダス観測値 {t:%H時}")
         self.state["amedas"] = t.isoformat()
         return "✅ 投稿しました"
 
@@ -395,7 +484,8 @@ class WeatherBot(discord.Client):
                     description=f"{count}/{len(rows)}地点。色の付いた地点は大気が不安定・湿潤。"
                                 "詳しくは各地域のエマグラムチャンネルへ")
                 embed.set_image(url=f"attachment://{mark}.png")
-                await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
+                sent = await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
+                await self.archive_post(sent, f"全国の大気の安定度 {t:%m/%d %H時}")
                 messages.append(f"全国まとめ({t:%m/%d %H時})を投稿しました")
             self.emagram.summary_done(t)
         return messages
@@ -427,9 +517,10 @@ class WeatherBot(discord.Client):
         embed.set_footer(text="指数は指定気圧面の値だけから計算した概算です")
         mark = self.marker(key, value) if not force else f"emagram-manual-{point}"
         embed.set_image(url=f"attachment://{mark}.png")
-        await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
+        sent = await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
         if not force:
             self.emagram.done(point, t)
+            await self.archive_post(sent, title)
             self.emagram.record(point, t, indices)
         return f"✅ {t:%m/%d %H時}の分を投稿しました"
 
@@ -454,13 +545,18 @@ class WeatherBot(discord.Client):
             key = now.date().isoformat()
             head = await channel.send(
                 f"📝 **{now:%m/%d}の予報ノート**\n今日の **{NOTE_STATION}の最高気温** と **降水の有無(1mm以上)** を予想しましょう。"
-                f"\n提出は `/yoso`、締切は **{NOTE_DEADLINE_HOUR}時** です。")
+                f"\n提出は `/yoso`、締切は **{NOTE_DEADLINE_HOUR}時** です。気象庁の予報とも比べて採点します(気象庁の予報は採点時に公開)。")
             thread = await head.create_thread(name=f"{now:%m/%d} 予報ノート",
                                               auto_archive_duration=1440)
             await thread.send(CHECKLIST)
             self.notes.notes[key] = {"station": NOTE_STATION, "thread_id": thread.id,
                                      "predictions": {}, "scored": False}
-            messages.append("今日のスレッドを作成しました")
+            try:  # 比較用に、この時点の気象庁の予報を記録しておく(採点まで公開しない)
+                self.notes.notes[key]["jma"] = await self.notes.jma_forecast(now.date())
+                messages.append("今日のスレッドを作成し、気象庁の予報を記録しました")
+            except Exception as e:
+                log.exception("気象庁の予報の取得に失敗")
+                messages.append(f"今日のスレッドを作成しました(気象庁の予報は取得できず:{e})")
 
         for key in self.notes.due_for_scoring(now):
             try:
@@ -477,6 +573,15 @@ class WeatherBot(discord.Client):
             if target:
                 await target.send(text[:1990])
             messages.append(f"{key}を採点しました")
+        if now.day == 1 and now.hour > SCORE_HOUR:  # 毎月1日に、前の月の検証をまとめる
+            prev = now.replace(day=1) - timedelta(days=1)
+            if self.state.get("monthly_done") != f"{prev:%Y-%m}":
+                report = self.notes.monthly(prev.year, prev.month)
+                channel = self.find_channel("予報ノート")
+                if report and channel:
+                    await channel.send(report[:1990])
+                    messages.append(f"{prev:%Y年%m月}の検証を投稿しました")
+                self.state["monthly_done"] = f"{prev:%Y-%m}"
         self.notes.prune()
         return "、".join(messages) if messages else "待機中"
 
@@ -485,6 +590,9 @@ class WeatherBot(discord.Client):
         mode, changed = await self.mode.evaluate()
         if changed:
             await self.announce_mode(mode)
+            await self.case_on_mode(mode)
+        elif mode.name != "通常" and self.cases.event and self.cases.add_reason(mode.reason):
+            await self.case_note(f"📌 {mode.reason}")
         return f"{mode.name}モード({mode.interval}分ごと)" + (" ※切り替えました" if changed else "")
 
     async def announce_mode(self, mode: Mode) -> None:
@@ -501,6 +609,68 @@ class WeatherBot(discord.Client):
         for name in targets:
             if channel := self.find_channel(name):
                 await channel.send(text)
+
+    # ----- 事例アーカイブ -----
+    async def case_thread(self):
+        ev = self.cases.event
+        if not ev:
+            return None
+        try:
+            return self.get_channel(ev["thread_id"]) or await self.fetch_channel(ev["thread_id"])
+        except discord.HTTPException:
+            return None
+
+    async def case_note(self, text: str) -> None:
+        if thread := await self.case_thread():
+            await thread.send(text[:1990])
+
+    async def case_on_mode(self, mode: Mode) -> None:
+        now = datetime.now(JST)
+        ev = self.cases.event
+        if mode.name == "通常":
+            if ev and "手動" not in ev["kinds"]:
+                await self.case_finish(now)
+            return
+        if ev:
+            if self.cases.add_kind(mode.name):
+                await self.case_note(f"➕ {mode.name}モードも加わりました:{mode.reason}")
+            return
+        await self.case_begin(mode.name, mode.reason, now)
+
+    async def case_begin(self, kind: str, reason: str, now: datetime, title: str = "") -> str:
+        channel = self.find_channel(ARCHIVE_CHANNEL)
+        if channel is None:
+            return f"#{ARCHIVE_CHANNEL} が見つかりません(/setup_weather を実行)"
+        label = title or kind.replace("監視", "")
+        icon = {"大雨監視": "🔴", "台風監視": "🌀"}.get(kind, "📁")
+        head = await channel.send(f"{icon} **{now:%Y/%m/%d %H:%M} {label}の事例** 記録中\n{reason}".strip())
+        thread = await head.create_thread(name=f"{now:%Y-%m-%d} {label}"[:90], auto_archive_duration=10080)
+        await thread.send("この事例の間に投稿された図へのリンクを、ここに集めます。")
+        self.cases.start(kind, reason, thread.id, head.id, now)
+        return "事例の記録を開始しました"
+
+    async def case_finish(self, now: datetime) -> str:
+        thread = await self.case_thread()
+        ev = self.cases.end(now)
+        if not ev:
+            return "記録中の事例はありません"
+        start = datetime.fromisoformat(ev["start"])
+        hours = (now - start).total_seconds() / 3600
+        text = (f"✅ **記録終了** 期間:{start:%m/%d %H:%M}〜{now:%m/%d %H:%M}(約{hours:.0f}時間)"
+                f"/集めた図:{ev['count']}件")
+        if ev["reasons"]:
+            text += "\n**記録された主な観測**\n" + "\n".join(f"・{r}" for r in ev["reasons"][-10:])
+        if thread:
+            await thread.send(text[:1990])
+            await thread.send(REVIEW)
+        channel = self.find_channel(ARCHIVE_CHANNEL)
+        if channel:
+            try:
+                head = await channel.fetch_message(ev["head_id"])
+                await head.edit(content=head.content.replace("記録中", f"({start:%m/%d %H:%M}〜{now:%m/%d %H:%M})"))
+            except discord.HTTPException:
+                pass
+        return "事例の記録を終了しました"
 
     # ----- 画像系(ひまわり・レーダー・解析雨量) -----
     async def check_image(self, product: ImageProduct, force: bool = False) -> str:
@@ -534,7 +704,8 @@ class WeatherBot(discord.Client):
         embed.set_image(url=f"attachment://{mark}-1.{images[0][1]}")
         files = [discord.File(io.BytesIO(data), filename=f"{mark}-{i + 1}.{ext}")
                  for i, (data, ext) in enumerate(images)]
-        await channel.send(embed=embed, files=files)
+        sent = await channel.send(embed=embed, files=files)
+        await self.archive_post(sent, f"{product.title} {t.astimezone(JST):%H:%M}")
         if not force:
             self.state[product.key] = vt
         return "✅ 投稿しました"
@@ -634,6 +805,33 @@ async def emagram_cmd(interaction: discord.Interaction, days_ago: app_commands.R
             continue
         results.append(f"{name}:" + await bot.post_emagram(channel, point, name, t, now, force=True))
     await interaction.followup.send(f"{t:%m/%d %H時}の結果\n" + "\n".join(results), ephemeral=True)
+
+
+@bot.tree.command(name="report", description="今月の予報検証(気象庁との比較)を表示します")
+async def show_report(interaction: discord.Interaction) -> None:
+    now = bot.notes.now()
+    report = bot.notes.monthly(now.year, now.month)
+    await interaction.response.send_message(report or "今月はまだ採点された予想がありません。", ephemeral=True)
+
+
+@bot.tree.command(name="case_start", description="事例アーカイブの記録を手動で開始します(前線の通過など)")
+@app_commands.describe(title="事例の名前(例:寒冷前線の通過)")
+async def case_start(interaction: discord.Interaction, title: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    if bot.cases.event:
+        await interaction.followup.send("すでに記録中の事例があります。`/case_end` で終了してください。", ephemeral=True)
+        return
+    result = await bot.case_begin("手動", f"手動で開始:{title}", datetime.now(JST), title)
+    save_state(bot.state)
+    await interaction.followup.send(result, ephemeral=True)
+
+
+@bot.tree.command(name="case_end", description="記録中の事例アーカイブを終了します")
+async def case_end(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    result = await bot.case_finish(datetime.now(JST))
+    save_state(bot.state)
+    await interaction.followup.send(result, ephemeral=True)
 
 
 if __name__ == "__main__":
