@@ -466,8 +466,39 @@ class WeatherBot(discord.Client):
         messages += await self.post_emagram_summary(now)
         return "、".join(messages) if messages else "待機中"
 
-    async def post_emagram_summary(self, now: datetime) -> list[str]:
+    async def fill_emagram_summary(self, now: datetime) -> list[str]:
+        """まとめる観測時刻の値が無い地点について、その時刻の観測値を取り直して指数を計算する
+        (図は投稿しない)。地点ごとに投稿した観測時刻がずれていても、まとめをそろえるため。"""
+        t = self.emagram.summary_target(now)
+        if t is None:
+            return []
+        filled, waiting = [], []
+        for point, name, region in EMAGRAM_POINTS:
+            if self.emagram.has(point, t) or not self.emagram.may_fill(point, t, now):
+                continue
+            try:
+                surface, levels, _ = await self.emagram.fetch(point, t)
+                if sum(1 for lv in levels if lv.get("t") is not None) < 5:
+                    self.emagram.fill_failed(point, t, now)
+                    waiting.append(name)
+                    continue
+                _, indices = await self.emagram.render(f"{name} {t:%m/%d %H時}", surface, levels)
+                self.emagram.record(point, t, indices)
+                filled.append(name)
+            except Exception:
+                log.exception("まとめ用の指数の計算に失敗: %s", name)
+                self.emagram.fill_failed(point, t, now)
+                waiting.append(name)
+            await asyncio.sleep(2)
         messages = []
+        if filled:
+            messages.append(f"全国まとめ用に{t:%m/%d %H時}の指数を計算:{'・'.join(filled)}")
+        if waiting:
+            messages.append(f"{t:%m/%d %H時}の値がまだ無い地点:{'・'.join(waiting)}(1時間後に再確認)")
+        return messages
+
+    async def post_emagram_summary(self, now: datetime) -> list[str]:
+        messages = await self.fill_emagram_summary(now)
         for t in self.emagram.summary_due(now):
             channel = self.find_channel(SUMMARY_CHANNEL)
             fonts = await self.amedas.ensure_fonts()
