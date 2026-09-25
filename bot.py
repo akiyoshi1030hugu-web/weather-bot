@@ -521,7 +521,6 @@ class WeatherBot(discord.Client):
         mark = self.marker(product.key, vt)
 
         images = [await self.composer.render(product, entry, area) for area in product.areas]
-        ext = "jpg" if product.kind == "satellite" else "png"
         t = parse_utc(vt)
         embed = discord.Embed(title=product.title, url=product.page_url, color=0x805AD5,
                               description=product.note)
@@ -532,9 +531,9 @@ class WeatherBot(discord.Client):
         source = "気象庁" if product.kind == "satellite" else "気象庁(降水)・地理院タイル(背景地図)"
         embed.add_field(name="出典", value=source, inline=True)
         embed.set_footer(text=f"検知 {now_jst_text()}")
-        embed.set_image(url=f"attachment://{mark}-1.{ext}")
-        files = [discord.File(io.BytesIO(img), filename=f"{mark}-{i + 1}.{ext}")
-                 for i, img in enumerate(images)]
+        embed.set_image(url=f"attachment://{mark}-1.{images[0][1]}")
+        files = [discord.File(io.BytesIO(data), filename=f"{mark}-{i + 1}.{ext}")
+                 for i, (data, ext) in enumerate(images)]
         await channel.send(embed=embed, files=files)
         if not force:
             self.state[product.key] = vt
