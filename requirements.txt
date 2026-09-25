@@ -3,3 +3,6 @@ aiohttp>=3.9
 pymupdf>=1.24
 python-dotenv>=1.0
 Pillow>=10.1
+matplotlib>=3.8
+metpy>=1.6
+beautifulsoup4>=4.12
