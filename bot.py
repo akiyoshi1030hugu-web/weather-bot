@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import io
 import json
+import re
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from amedas import AmedasTable
+from emagram import PAGE_URL as EMAGRAM_PAGE, Emagram
 from mode import Mode, ModeWatcher
 from note import CHECKLIST, NOTE_DEADLINE_HOUR, NOTE_STATION, NoteManager
 from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
@@ -85,6 +87,16 @@ def make_batches(items: list[tuple[str, bytes]]) -> list[list[tuple[str, bytes]]
     return batches
 
 
+def latest_file(files: list[str]) -> str:
+    """ファイル名に含まれる日時(12〜14桁の数字)が最も新しいものを選ぶ。
+    一覧の並び順に頼らないため。日時が読み取れない場合は一覧の最後を使う。"""
+    def stamp(name: str) -> str:
+        found = re.findall(r"\d{12,14}", name)
+        return max(found) if found else ""
+    best = max(files, key=stamp)
+    return best if stamp(best) else files[-1]
+
+
 def to_jst_text(http_date: str | None) -> str:
     if not http_date:
         return "不明"
@@ -106,6 +118,7 @@ class WeatherBot(discord.Client):
         self.mode: ModeWatcher | None = None
         self.amedas: AmedasTable | None = None
         self.notes: NoteManager | None = None
+        self.emagram: Emagram | None = None
         self.lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
@@ -117,6 +130,7 @@ class WeatherBot(discord.Client):
         self.mode = ModeWatcher(self.session)
         self.amedas = AmedasTable(self.session)
         self.notes = NoteManager(self.session, self.state)
+        self.emagram = Emagram(self.session, self.state, self.emagram_font)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         try:
@@ -170,6 +184,7 @@ class WeatherBot(discord.Client):
                 results.append(await self.safe(wm.title, self.check_weather_map(wm)))
             results.append(await self.safe("アメダス一覧表", self.check_amedas()))
             results.append(await self.safe("予報ノート", self.check_note()))
+            results.append(await self.safe("エマグラム", self.check_emagram()))
             results.append(await self.safe("投稿間隔の自動判定", self.update_mode()))
             for product in IMAGE_PRODUCTS:
                 results.append(await self.safe(product.title, self.check_image(product)))
@@ -252,7 +267,7 @@ class WeatherBot(discord.Client):
         if not files:
             keys = ", ".join(data.get("near", {}).keys())
             return f"天気図一覧に '{src.list_key}' がありません(ある種類: {keys})"
-        filename = files[-1]
+        filename = latest_file(files)
         if (msg := self.is_new(src.key, filename)) is not None:
             return msg
         channel = self.find_channel(src.channel)
@@ -302,6 +317,52 @@ class WeatherBot(discord.Client):
         await channel.send(**self.amedas_message(t, image, text, missing))
         self.state["amedas"] = t.isoformat()
         return "✅ 投稿しました"
+
+    # ----- エマグラム -----
+    async def emagram_font(self):
+        fonts = await self.amedas.ensure_fonts()
+        return fonts["regular"] if fonts else None
+
+    async def check_emagram(self) -> str:
+        now = datetime.now(JST)
+        items = await self.emagram.due(now)
+        if not items:
+            return "待機中"
+        channel = self.find_channel("エマグラム")
+        if channel is None:
+            return "#エマグラム が見つかりません(/setup_weather を実行)"
+        messages = []
+        for point, name, t in items:
+            try:
+                surface, levels = await self.emagram.fetch(point, t)
+                if sum(1 for lv in levels if lv.get("t") is not None) < 5:
+                    self.emagram.postpone(point, now)
+                    messages.append(f"{name}:まだ公開されていません(30分後に再確認)")
+                    continue
+                utc = t.astimezone(timezone.utc)
+                title = f"エマグラム {name}  {t:%m/%d %H時} JST({utc:%H}UTC)"
+                png, indices = await self.emagram.render(title, surface, levels)
+            except Exception as e:
+                log.exception("エマグラム作成失敗: %s", name)
+                self.emagram.postpone(point, now)
+                messages.append(f"{name}:⚠️ {e}")
+                continue
+            embed = discord.Embed(title=title, url=EMAGRAM_PAGE, color=0xC53030)
+            for k, v in indices.items():
+                embed.add_field(name=k, value=v, inline=True)
+            embed.add_field(
+                name="見るポイント", inline=False,
+                value="気温と露点の差が小さい層=湿った層(雲の目安)。SSIは3以下で雷雨の可能性、"
+                      "0以下で活発、-3以下で激しい対流の目安。K指数は30以上で雷雨の可能性が高い。"
+                      "逆転層(上空ほど気温が高い層)の有無と高さも確認")
+            embed.add_field(name="出典", value="気象庁 高層気象観測(指定気圧面)", inline=False)
+            embed.set_footer(text="指数は指定気圧面の値だけから計算した概算です")
+            embed.set_image(url="attachment://emagram.png")
+            await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename="emagram.png"))
+            self.emagram.done(point, t)
+            messages.append(f"{name}:✅ 投稿しました")
+            await asyncio.sleep(2)
+        return "、".join(messages)
 
     # ----- 予報ノート -----
     async def note_thread(self, key: str):
