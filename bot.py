@@ -17,7 +17,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from amedas import AmedasTable
-from emagram import PAGE_URL as EMAGRAM_PAGE, Emagram
+from emagram import EMAGRAM_POINTS, PAGE_URL as EMAGRAM_PAGE, Emagram
 from mode import Mode, ModeWatcher
 from note import CHECKLIST, NOTE_DEADLINE_HOUR, NOTE_STATION, NoteManager
 from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
@@ -37,6 +37,7 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "10"))
 POST_ON_FIRST_RUN = os.getenv("POST_ON_FIRST_RUN", "0") == "1"
+HISTORY_LIMIT = 30  # 再送防止のために確認する最近の投稿数
 STATE_PATH = Path(os.getenv("DATA_DIR", "./data")) / "state.json"
 RENDER_ZOOM = float(os.getenv("RENDER_ZOOM", "3.0"))  # PDF→画像の拡大率(2.0で約144dpi、3.0で約216dpi)
 MAX_FILE_BYTES = 9 * 1024 * 1024  # Discordの添付上限(10MB)より少し小さく
@@ -199,6 +200,28 @@ class WeatherBot(discord.Client):
             log.exception("取得失敗: %s", label)
             return f"{label}: ⚠️ エラー ({e})"
 
+    @staticmethod
+    def marker(key: str, value: str) -> str:
+        """投稿を識別する印。添付ファイル名の先頭に付ける。"""
+        return f"{key}-{hashlib.sha1(value.encode()).hexdigest()[:10]}"
+
+    async def already_posted(self, channel, key: str, value: str) -> bool:
+        """チャンネルの最近の投稿に、同じ内容(同じ印の添付)があるか。"""
+        mark = self.marker(key, value)
+        async for message in channel.history(limit=HISTORY_LIMIT):
+            if message.author.id != self.user.id:
+                continue
+            if any(a.filename.startswith(mark) for a in message.attachments):
+                return True
+        return False
+
+    async def skip_if_posted(self, channel, key: str, value: str) -> str | None:
+        """すでに投稿済みなら記録して理由を返す。未投稿ならNone。"""
+        if await self.already_posted(channel, key, value):
+            self.state[key] = value
+            return "投稿済み(チャンネルで確認したので再送しません)"
+        return None
+
     def is_new(self, key: str, value: str) -> str | None:
         """新着ならNone、そうでなければ結果メッセージを返す。"""
         prev = self.state.get(key)
@@ -217,6 +240,9 @@ class WeatherBot(discord.Client):
         channel = self.find_channel(src.channel)
         if channel is None:
             return f"#{src.channel} が見つかりません(/setup_weather を実行)"
+        if (msg := await self.skip_if_posted(channel, src.key, fp)) is not None:
+            return msg
+        mark = self.marker(src.key, fp)
 
         pdf = await self.get_bytes(src.url)
         digest = hashlib.sha256(pdf).hexdigest()
@@ -235,11 +261,11 @@ class WeatherBot(discord.Client):
         if src.hint:
             embed.add_field(name="見るポイント", value=src.hint, inline=False)
         embed.set_footer(text=f"検知 {now_jst_text()}|図中の時刻はUTC(JST=UTC+9)")
-        embed.set_image(url="attachment://page1.png")
+        embed.set_image(url=f"attachment://{mark}-p1.png")
 
-        items = [(f"page{i + 1}.png", img) for i, img in enumerate(images)]
+        items = [(f"{mark}-p{i + 1}.png", img) for i, img in enumerate(images)]
         if src.attach_pdf and len(pdf) <= MAX_FILE_BYTES:
-            items.append((f"{src.key}.pdf", pdf))
+            items.append((f"{mark}.pdf", pdf))
         batches = make_batches(items)
         for n, batch in enumerate(batches):
             kwargs = {"embed": embed} if n == 0 else {
@@ -273,6 +299,9 @@ class WeatherBot(discord.Client):
         channel = self.find_channel(src.channel)
         if channel is None:
             return f"#{src.channel} が見つかりません(/setup_weather を実行)"
+        if (msg := await self.skip_if_posted(channel, src.key, filename)) is not None:
+            return msg
+        mark = self.marker(src.key, filename)
 
         png = await self.get_bytes(src.image_base + filename)
         embed = discord.Embed(title=src.title, url=src.page_url, color=0x2F855A,
@@ -282,15 +311,15 @@ class WeatherBot(discord.Client):
         if src.hint:
             embed.add_field(name="見るポイント", value=src.hint, inline=False)
         embed.set_footer(text=f"検知 {now_jst_text()}|図中の時刻はUTC(JST=UTC+9)")
-        embed.set_image(url=f"attachment://{src.key}.png")
+        embed.set_image(url=f"attachment://{mark}.png")
         await channel.send(embed=embed,
-                           file=discord.File(io.BytesIO(png), filename=f"{src.key}.png"))
+                           file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
         self.state[src.key] = filename
         return "✅ 投稿しました"
 
     # ----- アメダス一覧表 -----
     def amedas_message(self, t: datetime, image: bytes | None, text: str,
-                       missing: list[str]) -> dict:
+                       missing: list[str], mark: str = "amedas-now") -> dict:
         utc = t.astimezone(timezone.utc)
         embed = discord.Embed(title=f"アメダス観測値 {t:%m/%d %H:%M} JST({utc:%H} UTC)",
                               url="https://www.jma.go.jp/bosai/amedas/",
@@ -300,8 +329,8 @@ class WeatherBot(discord.Client):
             embed.add_field(name="見つからなかった地点", value="、".join(missing), inline=False)
         if image is None:
             return {"embed": embed}
-        embed.set_image(url="attachment://amedas.png")
-        return {"embed": embed, "file": discord.File(io.BytesIO(image), filename="amedas.png")}
+        embed.set_image(url=f"attachment://{mark}.png")
+        return {"embed": embed, "file": discord.File(io.BytesIO(image), filename=f"{mark}.png")}
 
     async def check_amedas(self) -> str:
         latest = await self.amedas.latest_time()
@@ -313,8 +342,11 @@ class WeatherBot(discord.Client):
         channel = self.find_channel("アメダス")
         if channel is None:
             return "#アメダス が見つかりません(/setup_weather を実行)"
+        if (msg := await self.skip_if_posted(channel, "amedas", t.isoformat())) is not None:
+            return msg
         image, text, missing = await self.amedas.build(t)
-        await channel.send(**self.amedas_message(t, image, text, missing))
+        await channel.send(**self.amedas_message(t, image, text, missing,
+                                                 self.marker("amedas", t.isoformat())))
         self.state["amedas"] = t.isoformat()
         return "✅ 投稿しました"
 
@@ -332,37 +364,50 @@ class WeatherBot(discord.Client):
         if channel is None:
             return "#エマグラム が見つかりません(/setup_weather を実行)"
         messages = []
-        for point, name, t in items:
-            try:
-                surface, levels = await self.emagram.fetch(point, t)
-                if sum(1 for lv in levels if lv.get("t") is not None) < 5:
-                    self.emagram.postpone(point, now)
-                    messages.append(f"{name}:まだ公開されていません(30分後に再確認)")
-                    continue
-                utc = t.astimezone(timezone.utc)
-                title = f"エマグラム {name}  {t:%m/%d %H時} JST({utc:%H}UTC)"
-                png, indices = await self.emagram.render(title, surface, levels)
-            except Exception as e:
-                log.exception("エマグラム作成失敗: %s", name)
+        for point, name, times in items:
+            result = "未公開"
+            for t in times:  # 新しい観測時刻から順に、公開されているものを探す
+                result = await self.post_emagram(channel, point, name, t, now)
+                if not result.startswith("まだ観測値がありません"):
+                    break
+            if result.startswith("まだ観測値がありません"):
                 self.emagram.postpone(point, now)
-                messages.append(f"{name}:⚠️ {e}")
-                continue
-            embed = discord.Embed(title=title, url=EMAGRAM_PAGE, color=0xC53030)
-            for k, v in indices.items():
-                embed.add_field(name=k, value=v, inline=True)
-            embed.add_field(
-                name="見るポイント", inline=False,
-                value="気温と露点の差が小さい層=湿った層(雲の目安)。SSIは3以下で雷雨の可能性、"
-                      "0以下で活発、-3以下で激しい対流の目安。K指数は30以上で雷雨の可能性が高い。"
-                      "逆転層(上空ほど気温が高い層)の有無と高さも確認")
-            embed.add_field(name="出典", value="気象庁 高層気象観測(指定気圧面)", inline=False)
-            embed.set_footer(text="指数は指定気圧面の値だけから計算した概算です")
-            embed.set_image(url="attachment://emagram.png")
-            await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename="emagram.png"))
-            self.emagram.done(point, t)
-            messages.append(f"{name}:✅ 投稿しました")
+                result = f"直近{len(times)}回分がまだ公開されていません(30分後に再確認)"
+            messages.append(f"{name}:{result}")
             await asyncio.sleep(2)
         return "、".join(messages)
+
+    async def post_emagram(self, channel, point: str, name: str, t: datetime,
+                           now: datetime, force: bool = False) -> str:
+        key, value = f"emagram_{point}", t.isoformat()
+        if not force and (msg := await self.skip_if_posted(channel, key, value)) is not None:
+            return f"{t:%m/%d %H時} " + msg
+        try:
+            surface, levels, info = await self.emagram.fetch(point, t)
+            if sum(1 for lv in levels if lv.get("t") is not None) < 5:
+                return f"まだ観測値がありません({t:%m/%d %H時})[{info}]"
+            utc = t.astimezone(timezone.utc)
+            title = f"エマグラム {name}  {t:%m/%d %H時} JST({utc:%H}UTC)"
+            png, indices = await self.emagram.render(title, surface, levels)
+        except Exception as e:
+            log.exception("エマグラム作成失敗: %s", name)
+            return f"⚠️ {e}"
+        embed = discord.Embed(title=title, url=EMAGRAM_PAGE, color=0xC53030)
+        for k, v in indices.items():
+            embed.add_field(name=k, value=v, inline=True)
+        embed.add_field(
+            name="見るポイント", inline=False,
+            value="気温と露点の差が小さい層=湿った層(雲の目安)。SSIは3以下で雷雨の可能性、"
+                  "0以下で活発、-3以下で激しい対流の目安。K指数は30以上で雷雨の可能性が高い。"
+                  "逆転層(上空ほど気温が高い層)の有無と高さも確認")
+        embed.add_field(name="出典", value="気象庁 高層気象観測(指定気圧面)", inline=False)
+        embed.set_footer(text="指数は指定気圧面の値だけから計算した概算です")
+        mark = self.marker(key, value) if not force else f"emagram-manual-{point}"
+        embed.set_image(url=f"attachment://{mark}.png")
+        await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
+        if not force:
+            self.emagram.done(point, t)
+        return f"✅ {t:%m/%d %H時}の分を投稿しました"
 
     # ----- 予報ノート -----
     async def note_thread(self, key: str):
@@ -447,6 +492,9 @@ class WeatherBot(discord.Client):
         channel = self.find_channel(product.channel)
         if channel is None:
             return f"#{product.channel} が見つかりません(/setup_weather を実行)"
+        if not force and (msg := await self.skip_if_posted(channel, product.key, vt)) is not None:
+            return msg
+        mark = self.marker(product.key, vt)
 
         images = [await self.composer.render(product, entry, area) for area in product.areas]
         ext = "jpg" if product.kind == "satellite" else "png"
@@ -460,8 +508,8 @@ class WeatherBot(discord.Client):
         source = "気象庁" if product.kind == "satellite" else "気象庁(降水)・地理院タイル(背景地図)"
         embed.add_field(name="出典", value=source, inline=True)
         embed.set_footer(text=f"検知 {now_jst_text()}")
-        embed.set_image(url=f"attachment://{product.key}_1.{ext}")
-        files = [discord.File(io.BytesIO(img), filename=f"{product.key}_{i + 1}.{ext}")
+        embed.set_image(url=f"attachment://{mark}-1.{ext}")
+        files = [discord.File(io.BytesIO(img), filename=f"{mark}-{i + 1}.{ext}")
                  for i, img in enumerate(images)]
         await channel.send(embed=embed, files=files)
         if not force:
@@ -544,6 +592,25 @@ async def yoso(interaction: discord.Interaction, max_temp: float,
 async def show_score(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(bot.notes.summary(str(interaction.user.id)),
                                             ephemeral=True)
+
+
+@bot.tree.command(name="emagram", description="指定した日時のエマグラムを作成します(動作確認用)")
+@app_commands.describe(days_ago="何日前か(0=今日、1=昨日)", hour="観測時刻")
+@app_commands.choices(hour=[app_commands.Choice(name="9時", value=9),
+                            app_commands.Choice(name="21時", value=21)])
+async def emagram_cmd(interaction: discord.Interaction, days_ago: app_commands.Range[int, 0, 30],
+                      hour: app_commands.Choice[int]) -> None:
+    await interaction.response.defer(ephemeral=True)
+    channel = bot.find_channel("エマグラム")
+    if channel is None:
+        await interaction.followup.send("#エマグラム が見つかりません(/setup_weather を実行)", ephemeral=True)
+        return
+    now = datetime.now(JST)
+    t = (now - timedelta(days=days_ago)).replace(hour=hour.value, minute=0, second=0, microsecond=0)
+    results = []
+    for point, name in EMAGRAM_POINTS:
+        results.append(f"{name}:" + await bot.post_emagram(channel, point, name, t, now, force=True))
+    await interaction.followup.send(f"{t:%m/%d %H時}の結果\n" + "\n".join(results), ephemeral=True)
 
 
 if __name__ == "__main__":
