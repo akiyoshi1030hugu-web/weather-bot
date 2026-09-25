@@ -25,7 +25,7 @@ EMAGRAM_POINTS = [(c.strip(), n.strip()) for c, n in (
     item.split(":") for item in os.getenv(
         "EMAGRAM_POINTS", "47778:潮岬,47807:福岡,47827:鹿児島").split(","))]
 RETRY_MINUTES = 30
-GIVE_UP_HOURS = 30
+LOOKBACK = 6  # 最大3日分(9時・21時×3日)さかのぼる
 PLOT_SCRIPT = Path(__file__).with_name("emagram_plot.py")
 
 NUM = re.compile(r"^-?\d+(\.\d+)?\)?$")  # 数値、または準正常値「)」付き
@@ -57,12 +57,19 @@ def parse_table(table) -> list[dict]:
     return rows
 
 
-def parse_page(html: str) -> tuple[dict | None, list[dict]]:
+def parse_page(html: str) -> tuple[dict | None, list[dict], str]:
+    """(地上の値, 指定気圧面の値, 診断メッセージ) を返す。"""
     soup = BeautifulSoup(html, "html.parser")
     t1, t2 = soup.find("table", id="tablefix1"), soup.find("table", id="tablefix2")
     surface = parse_table(t1) if t1 else []
     levels = parse_table(t2) if t2 else []
-    return (surface[0] if surface else None), levels
+    n_temp = sum(1 for lv in levels if lv.get("t") is not None)
+    if t2 is None:
+        ids = [t.get("id") for t in soup.find_all("table")]
+        info = f"観測値の表が見つかりません(ページ内の表: {ids or 'なし'})"
+    else:
+        info = f"表あり:指定気圧面 {len(levels)}層、うち気温あり {n_temp}層"
+    return (surface[0] if surface else None), levels, info
 
 
 def latest_obs_time(now: datetime) -> datetime:
@@ -80,19 +87,25 @@ class Emagram:
         self.get_font = font_path_getter
         self.next_try: dict[str, datetime] = {}
 
-    async def fetch(self, point: str, t: datetime) -> tuple[dict | None, list[dict]]:
+    async def fetch(self, point: str, t: datetime) -> tuple[dict | None, list[dict], str]:
+        """すべてのURLを試し、観測値が最も多く取れたものを返す。"""
         query = f"?year={t.year}&month={t.month:02d}&day={t.day:02d}&hour={t.hour}&atm=&point={point}&view="
-        last_error = None
+        best, notes = None, []
         for base in BASES:
             try:
                 async with self.session.get(base + query) as r:
                     if r.status != 200:
-                        last_error = f"HTTP {r.status}"
+                        notes.append(f"HTTP {r.status}")
                         continue
-                    return parse_page(await r.text())
+                    surface, levels, info = parse_page(await r.text())
+                    notes.append(info)
+                    if best is None or len(levels) > len(best[1]):
+                        best = (surface, levels)
             except aiohttp.ClientError as e:
-                last_error = str(e)
-        raise RuntimeError(f"高層データを取得できません({last_error})")
+                notes.append(str(e))
+        if best is None:
+            raise RuntimeError(f"高層データを取得できません({' / '.join(notes)})")
+        return best[0], best[1], " / ".join(notes)
 
     async def render(self, title: str, surface: dict | None, levels: list[dict]) -> tuple[bytes, dict]:
         font = await self.get_font()
@@ -114,19 +127,29 @@ class Emagram:
                 raise RuntimeError("エマグラムの描画に失敗しました: " + err.decode(errors="ignore")[-300:])
             return dst.read_bytes(), json.loads(out.decode() or "{}")
 
-    async def due(self, now: datetime) -> list[tuple[str, str, datetime]]:
-        """投稿すべき(地点番号, 地点名, 観測時刻)の一覧。"""
+    def candidates(self, point: str, now: datetime) -> list[datetime]:
+        """まだ投稿していない観測時刻を、新しい順に最大 LOOKBACK 回分。
+        当日の観測値がまだ公開されていなくても、公開済みの最新分を投稿できるようにする。"""
+        posted = self.state.get(f"emagram_{point}")
         t = latest_obs_time(now)
+        out = []
+        for _ in range(LOOKBACK):
+            if posted and t.isoformat() <= posted:
+                break
+            out.append(t)
+            t -= timedelta(hours=12)
+        return out
+
+    async def due(self, now: datetime) -> list[tuple[str, str, list[datetime]]]:
+        """(地点番号, 地点名, 試す観測時刻の一覧) を返す。"""
         items = []
         for point, name in EMAGRAM_POINTS:
             key = f"emagram_{point}"
-            if self.state.get(key) == t.isoformat():
-                continue
-            if now - t > timedelta(hours=GIVE_UP_HOURS):
-                continue
             if self.next_try.get(key) and now < self.next_try[key]:
                 continue
-            items.append((point, name, t))
+            times = self.candidates(point, now)
+            if times:
+                items.append((point, name, times))
         return items
 
     def postpone(self, point: str, now: datetime) -> None:
