@@ -17,7 +17,8 @@ from discord import app_commands
 from discord.ext import tasks
 
 from amedas import AmedasTable
-from emagram import EMAGRAM_POINTS, PAGE_URL as EMAGRAM_PAGE, Emagram
+from emagram import EMAGRAM_POINTS, PAGE_URL as EMAGRAM_PAGE, SUMMARY_CHANNEL, Emagram, channel_for
+from emagram_summary import render_summary
 from mode import Mode, ModeWatcher
 from note import CHECKLIST, NOTE_DEADLINE_HOUR, NOTE_STATION, NoteManager
 from images import IMAGE_PRODUCTS, ImageProduct, TileComposer, parse_utc, pick_latest
@@ -357,14 +358,12 @@ class WeatherBot(discord.Client):
 
     async def check_emagram(self) -> str:
         now = datetime.now(JST)
-        items = await self.emagram.due(now)
-        if not items:
-            return "待機中"
-        channel = self.find_channel("エマグラム")
-        if channel is None:
-            return "#エマグラム が見つかりません(/setup_weather を実行)"
         messages = []
-        for point, name, times in items:
+        for point, name, region, times in await self.emagram.due(now):
+            channel = self.find_channel(channel_for(region))
+            if channel is None:
+                messages.append(f"#{channel_for(region)} が見つかりません(/setup_weather を実行)")
+                continue
             result = "未公開"
             for t in times:  # 新しい観測時刻から順に、公開されているものを探す
                 result = await self.post_emagram(channel, point, name, t, now)
@@ -375,7 +374,31 @@ class WeatherBot(discord.Client):
                 result = f"直近{len(times)}回分がまだ公開されていません(30分後に再確認)"
             messages.append(f"{name}:{result}")
             await asyncio.sleep(2)
-        return "、".join(messages)
+        messages += await self.post_emagram_summary(now)
+        return "、".join(messages) if messages else "待機中"
+
+    async def post_emagram_summary(self, now: datetime) -> list[str]:
+        messages = []
+        for t in self.emagram.summary_due(now):
+            channel = self.find_channel(SUMMARY_CHANNEL)
+            fonts = await self.amedas.ensure_fonts()
+            if channel is None or fonts is None:
+                messages.append(f"#{SUMMARY_CHANNEL} が見つからないか、フォントを準備できません")
+                break
+            if await self.skip_if_posted(channel, "emagram_summary", t.isoformat()) is None:
+                rows = self.emagram.summary_rows(t)
+                png = await asyncio.to_thread(render_summary, t, rows, fonts)
+                mark = self.marker("emagram_summary", t.isoformat())
+                count = sum(1 for _, _, idx in rows if idx)
+                embed = discord.Embed(
+                    title=f"全国の大気の安定度 {t:%m/%d %H時}観測", url=EMAGRAM_PAGE, color=0xC53030,
+                    description=f"{count}/{len(rows)}地点。色の付いた地点は大気が不安定・湿潤。"
+                                "詳しくは各地域のエマグラムチャンネルへ")
+                embed.set_image(url=f"attachment://{mark}.png")
+                await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
+                messages.append(f"全国まとめ({t:%m/%d %H時})を投稿しました")
+            self.emagram.summary_done(t)
+        return messages
 
     async def post_emagram(self, channel, point: str, name: str, t: datetime,
                            now: datetime, force: bool = False) -> str:
@@ -407,6 +430,7 @@ class WeatherBot(discord.Client):
         await channel.send(embed=embed, file=discord.File(io.BytesIO(png), filename=f"{mark}.png"))
         if not force:
             self.emagram.done(point, t)
+            self.emagram.record(point, t, indices)
         return f"✅ {t:%m/%d %H時}の分を投稿しました"
 
     # ----- 予報ノート -----
@@ -601,14 +625,14 @@ async def show_score(interaction: discord.Interaction) -> None:
 async def emagram_cmd(interaction: discord.Interaction, days_ago: app_commands.Range[int, 0, 30],
                       hour: app_commands.Choice[int]) -> None:
     await interaction.response.defer(ephemeral=True)
-    channel = bot.find_channel("エマグラム")
-    if channel is None:
-        await interaction.followup.send("#エマグラム が見つかりません(/setup_weather を実行)", ephemeral=True)
-        return
     now = datetime.now(JST)
     t = (now - timedelta(days=days_ago)).replace(hour=hour.value, minute=0, second=0, microsecond=0)
     results = []
-    for point, name in EMAGRAM_POINTS:
+    for point, name, region in EMAGRAM_POINTS:
+        channel = bot.find_channel(channel_for(region))
+        if channel is None:
+            results.append(f"{name}:#{channel_for(region)} が見つかりません(/setup_weather を実行)")
+            continue
         results.append(f"{name}:" + await bot.post_emagram(channel, point, name, t, now, force=True))
     await interaction.followup.send(f"{t:%m/%d %H時}の結果\n" + "\n".join(results), ephemeral=True)
 
