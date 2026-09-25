@@ -7,6 +7,7 @@
 import asyncio
 import io
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -143,7 +144,7 @@ class TileComposer:
         left, top = x0 - tx0 * TILE, y0 - ty0 * TILE
         return canvas.crop((int(left), int(top), int(left + x1 - x0), int(top + y1 - y0)))
 
-    async def render(self, product: ImageProduct, entry: dict, area: Area) -> bytes:
+    async def render(self, product: ImageProduct, entry: dict, area: Area) -> tuple[bytes, str]:
         fmt = {"bt": entry["basetime"], "vt": entry["validtime"],
                "member": entry.get("member", "none")}
         if product.kind == "satellite":
@@ -158,13 +159,24 @@ class TileComposer:
         return await asyncio.to_thread(encode, img, product.kind)
 
 
-def encode(img: Image.Image, kind: str) -> bytes:
-    buf = io.BytesIO()
+RAIN_JPEG_QUALITY = int(os.getenv("RAIN_JPEG_QUALITY", "90"))
+
+
+def encode(img: Image.Image, kind: str) -> tuple[bytes, str]:
+    """画像を保存して (データ, 拡張子) を返す。
+    衛星画像はJPEG。雨の図はPNGとJPEGの両方を作り、小さいほうを使う
+    (色がべったりした図はPNG、背景地図が細かい図はJPEGが小さくなりやすいため)。"""
+    rgb = img.convert("RGB")
+    jpg = io.BytesIO()
     if kind == "satellite":
-        img.convert("RGB").save(buf, "JPEG", quality=92)
-    else:
-        img.save(buf, "PNG", optimize=True)
-    return buf.getvalue()
+        rgb.save(jpg, "JPEG", quality=92)
+        return jpg.getvalue(), "jpg"
+    rgb.save(jpg, "JPEG", quality=RAIN_JPEG_QUALITY, subsampling=0, optimize=True)
+    png = io.BytesIO()
+    rgb.save(png, "PNG", optimize=True)
+    if len(jpg.getvalue()) < len(png.getvalue()):
+        return jpg.getvalue(), "jpg"
+    return png.getvalue(), "png"
 
 
 def draw_grid(img: Image.Image, area: Area, light: bool = False) -> None:
