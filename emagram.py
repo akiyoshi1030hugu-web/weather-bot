@@ -33,7 +33,8 @@ for item in os.getenv("EMAGRAM_POINTS", DEFAULT_POINTS).split(","):
         EMAGRAM_POINTS.append((parts[0], parts[1], parts[2] if len(parts) > 2 else "西日本"))
 REGIONS = list(dict.fromkeys(region for _, _, region in EMAGRAM_POINTS))
 SUMMARY_CHANNEL = "エマグラム-全国まとめ"
-SUMMARY_WAIT_HOURS = 36  # 全地点がそろわなくても、この時間がたてばまとめを出す
+SUMMARY_WAIT_HOURS = 6   # まとめを作り始めてから、この時間待っても全地点がそろわなければ、そろった分で出す
+FILL_RETRY_MINUTES = 60  # まとめ用に値の無い地点を取り直す間隔
 
 
 def channel_for(region: str) -> str:
@@ -102,6 +103,7 @@ class Emagram:
         self.state = state
         self.get_font = font_path_getter
         self.next_try: dict[str, datetime] = {}
+        self.fill_next: dict[tuple[str, str], datetime] = {}
 
     async def fetch(self, point: str, t: datetime) -> tuple[dict | None, list[dict], str]:
         """すべてのURLを試し、観測値が最も多く取れたものを返す。"""
@@ -182,17 +184,43 @@ class Emagram:
         for old in sorted(store)[:-8]:  # 直近8回分(4日分)だけ残す
             del store[old]
 
-    def summary_due(self, now: datetime) -> list[datetime]:
+    def summary_target(self, now: datetime) -> datetime | None:
+        """まとめを作る観測時刻:まだまとめていない中で一番新しい時刻。
+        それより古い未完成の時刻は、まとめずに終える(古い情報を後から出さないため)。"""
         store = self.state.get("emagram_idx", {})
-        done = set(self.state.get("emagram_summary_done", []))
-        due = []
-        for key, per_point in store.items():
-            if key in done or not per_point:
-                continue
-            t = datetime.fromisoformat(key)
-            if len(per_point) >= len(EMAGRAM_POINTS) or now - t > timedelta(hours=SUMMARY_WAIT_HOURS):
-                due.append(t)
-        return sorted(due)
+        done = self.state.setdefault("emagram_summary_done", [])
+        pending = sorted(k for k, v in store.items() if v and k not in done)
+        if not pending:
+            return None
+        for old in pending[:-1]:
+            done.append(old)
+        first_seen = self.state.setdefault("emagram_first_seen", {})
+        first_seen.setdefault(pending[-1], now.isoformat())
+        for k in list(first_seen):
+            if k not in store:
+                del first_seen[k]
+        return datetime.fromisoformat(pending[-1])
+
+    def has(self, point: str, t: datetime) -> bool:
+        return point in self.state.get("emagram_idx", {}).get(t.isoformat(), {})
+
+    def may_fill(self, point: str, t: datetime, now: datetime) -> bool:
+        nxt = self.fill_next.get((point, t.isoformat()))
+        return nxt is None or now >= nxt
+
+    def fill_failed(self, point: str, t: datetime, now: datetime) -> None:
+        self.fill_next[(point, t.isoformat())] = now + timedelta(minutes=FILL_RETRY_MINUTES)
+
+    def summary_due(self, now: datetime) -> list[datetime]:
+        """全地点がそろったか、待ち時間を過ぎたら、まとめを出す。"""
+        t = self.summary_target(now)
+        if t is None:
+            return []
+        per_point = self.state.get("emagram_idx", {}).get(t.isoformat(), {})
+        started = datetime.fromisoformat(self.state["emagram_first_seen"][t.isoformat()])
+        if len(per_point) >= len(EMAGRAM_POINTS) or now - started >= timedelta(hours=SUMMARY_WAIT_HOURS):
+            return [t]
+        return []
 
     def summary_rows(self, t: datetime) -> list[tuple[str, str, dict]]:
         per_point = self.state.get("emagram_idx", {}).get(t.isoformat(), {})
