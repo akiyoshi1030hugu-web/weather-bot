@@ -20,10 +20,26 @@ JST = timezone(timedelta(hours=9))
 BASES = ["https://www.data.jma.go.jp/stats/etrn/upper/view/hourly_usp.php",
          "https://www.data.jma.go.jp/obd/stats/etrn/upper/view/hourly_usp.php"]
 PAGE_URL = "https://www.data.jma.go.jp/stats/etrn/upper/index.php"
-# 観測地点(地点番号:名前)。四国に近い潮岬と、九州の福岡・鹿児島
-EMAGRAM_POINTS = [(c.strip(), n.strip()) for c, n in (
-    item.split(":") for item in os.getenv(
-        "EMAGRAM_POINTS", "47778:潮岬,47807:福岡,47827:鹿児島").split(","))]
+# 観測地点(地点番号:名前:地域)。気象庁が国内でラジオゾンデ観測を行っている16地点
+DEFAULT_POINTS = ("47401:稚内:北日本,47412:札幌:北日本,47418:釧路:北日本,47582:秋田:北日本,"
+                  "47600:輪島:東日本,47646:館野:東日本,47678:八丈島:東日本,"
+                  "47741:松江:西日本,47778:潮岬:西日本,47807:福岡:西日本,47827:鹿児島:西日本,"
+                  "47909:名瀬:南西諸島,47918:石垣島:南西諸島,47945:南大東島:南西諸島,"
+                  "47971:父島:小笠原,47991:南鳥島:小笠原")
+EMAGRAM_POINTS = []
+for item in os.getenv("EMAGRAM_POINTS", DEFAULT_POINTS).split(","):
+    parts = [x.strip() for x in item.split(":")]
+    if len(parts) >= 2:
+        EMAGRAM_POINTS.append((parts[0], parts[1], parts[2] if len(parts) > 2 else "西日本"))
+REGIONS = list(dict.fromkeys(region for _, _, region in EMAGRAM_POINTS))
+SUMMARY_CHANNEL = "エマグラム-全国まとめ"
+SUMMARY_WAIT_HOURS = 36  # 全地点がそろわなくても、この時間がたてばまとめを出す
+
+
+def channel_for(region: str) -> str:
+    return f"エマグラム-{region}"
+
+
 RETRY_MINUTES = 30
 LOOKBACK = 6  # 最大3日分(9時・21時×3日)さかのぼる
 PLOT_SCRIPT = Path(__file__).with_name("emagram_plot.py")
@@ -140,16 +156,16 @@ class Emagram:
             t -= timedelta(hours=12)
         return out
 
-    async def due(self, now: datetime) -> list[tuple[str, str, list[datetime]]]:
-        """(地点番号, 地点名, 試す観測時刻の一覧) を返す。"""
+    async def due(self, now: datetime) -> list[tuple[str, str, str, list[datetime]]]:
+        """(地点番号, 地点名, 地域, 試す観測時刻の一覧) を返す。"""
         items = []
-        for point, name in EMAGRAM_POINTS:
+        for point, name, region in EMAGRAM_POINTS:
             key = f"emagram_{point}"
             if self.next_try.get(key) and now < self.next_try[key]:
                 continue
             times = self.candidates(point, now)
             if times:
-                items.append((point, name, times))
+                items.append((point, name, region, times))
         return items
 
     def postpone(self, point: str, now: datetime) -> None:
@@ -158,3 +174,31 @@ class Emagram:
     def done(self, point: str, t: datetime) -> None:
         self.state[f"emagram_{point}"] = t.isoformat()
         self.next_try.pop(f"emagram_{point}", None)
+
+    # ---------- 全国まとめ ----------
+    def record(self, point: str, t: datetime, indices: dict) -> None:
+        store = self.state.setdefault("emagram_idx", {})
+        store.setdefault(t.isoformat(), {})[point] = indices
+        for old in sorted(store)[:-8]:  # 直近8回分(4日分)だけ残す
+            del store[old]
+
+    def summary_due(self, now: datetime) -> list[datetime]:
+        store = self.state.get("emagram_idx", {})
+        done = set(self.state.get("emagram_summary_done", []))
+        due = []
+        for key, per_point in store.items():
+            if key in done or not per_point:
+                continue
+            t = datetime.fromisoformat(key)
+            if len(per_point) >= len(EMAGRAM_POINTS) or now - t > timedelta(hours=SUMMARY_WAIT_HOURS):
+                due.append(t)
+        return sorted(due)
+
+    def summary_rows(self, t: datetime) -> list[tuple[str, str, dict]]:
+        per_point = self.state.get("emagram_idx", {}).get(t.isoformat(), {})
+        return [(region, name, per_point.get(point, {})) for point, name, region in EMAGRAM_POINTS]
+
+    def summary_done(self, t: datetime) -> None:
+        done = self.state.setdefault("emagram_summary_done", [])
+        done.append(t.isoformat())
+        del done[:-10]
