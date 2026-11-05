@@ -131,6 +131,7 @@ class WeatherBot(discord.Client):
         self.state = load_state()
         self.session: aiohttp.ClientSession | None = None
         self.lock = asyncio.Lock()
+        self.fetch_all_mode = False   # /fetch_all の間は、初めて扱う図も投稿する
         self.events = Events(self.state)
         self.tc_info: dict[str, dict] = {}          # 台風ごとの最新の情報(進路図用)
 
@@ -268,7 +269,7 @@ class WeatherBot(discord.Client):
         prev = self.state.get(key)
         if prev == value:
             return "更新なし"
-        if prev is None and not POST_ON_FIRST_RUN:
+        if prev is None and not (POST_ON_FIRST_RUN or self.fetch_all_mode):
             self.state[key] = value
             return "初回のため記録のみ(次の更新から投稿)"
         return None
@@ -877,6 +878,24 @@ async def check_now(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     results = await bot.check_all()
     text = "\n".join(results)
+    for i in range(0, len(text), 1900):
+        await interaction.followup.send(text[i:i + 1900], ephemeral=True)
+
+
+@bot.tree.command(name="fetch_all", description="今手に入るデータを一度すべて取得します(投稿済みのものは飛ばします)")
+@app_commands.default_permissions(administrator=True)
+async def fetch_all(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    bot.fetch_all_mode = True
+    try:
+        results = await bot.check_all()
+    finally:
+        bot.fetch_all_mode = False
+    posted = [r for r in results if "✅" in r]
+    skipped = [r for r in results if "更新なし" in r or "投稿済み" in r]
+    other = [r for r in results if r not in posted and r not in skipped]
+    text = (f"**投稿 {len(posted)}件**/投稿済みなので飛ばした {len(skipped)}件/その他 {len(other)}件\n\n"
+            + "\n".join(posted + other))
     for i in range(0, len(text), 1900):
         await interaction.followup.send(text[i:i + 1900], ephemeral=True)
 
