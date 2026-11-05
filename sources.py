@@ -170,21 +170,21 @@ class AsasSource:
     page_url: str = f"{JMA}/bosai/weather_map/"
     list_key: str = "now"   # 天気図一覧(list.json)の中のどの種類か
     note: str = ""
-    region: str = "near"    # near=日本周辺、far=アジア太平洋
+    region: str = "near"    # near=日本周辺、asia=アジア太平洋(気象庁の天気図一覧の名前)
 
 
 ASAS = AsasSource()
 WEATHER_MAPS = [
     ASAS,
-    AsasSource(key="asas_far", title="太平洋地上天気図(アジア太平洋)", channel="太平洋地上天気図", region="far"),
+    AsasSource(key="asas_far", title="太平洋地上天気図(アジア太平洋)", channel="太平洋地上天気図", region="asia"),
     AsasSource(key="fsas24", title="地上予報天気図 24時間予想(日本周辺)", channel="地上予報天気図",
                list_key="ft24"),
     AsasSource(key="fsas48", title="地上予報天気図 48時間予想(日本周辺)", channel="地上予報天気図",
                list_key="ft48"),
     AsasSource(key="fsas24_far", title="地上予報天気図 24時間予想(アジア太平洋)", channel="地上予報天気図",
-               list_key="ft24", region="far"),
+               list_key="ft24", region="asia"),
     AsasSource(key="fsas48_far", title="地上予報天気図 48時間予想(アジア太平洋)", channel="地上予報天気図",
-               list_key="ft48", region="far"),
+               list_key="ft48", region="asia"),
 ]
 
 # /setup_weather で作成するカテゴリーとチャンネル

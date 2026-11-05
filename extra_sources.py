@@ -4,14 +4,12 @@
   https://www.data.jma.go.jp/cpd/diag/sokuho/<YYYYMM>/fig13.gif など
   図13 500hPa高度・平年偏差 / 図15 海面気圧・平年偏差 / 図16 850hPa気温・平年偏差
 
-沿岸波浪実況図:気象庁「波浪図」のページ(awjp.html)が読み込んでいる画像を、ページと
-  スクリプトから探す。見つからないときや変わったときは、WAVE_IMAGE_URL に画像のURLを直接書けば使える
-  ({YYYYMMDDHH} などは書かない、いつも最新の図を指すURL)。
+沿岸波浪実況図:気象庁「波浪図」のPDF
+  https://www.data.jma.go.jp/waveinf/data/chart/awjp<YYMMDDHH(UTC)>.pdf
+  (例:awjp26110500.pdf = 2026年11月5日00UTC)。新しい時刻から順に、ある時刻を探す。
 """
 import os
-import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin
 
 JST = timezone(timedelta(hours=9))
 SOKUHO = "https://www.data.jma.go.jp/cpd/diag/sokuho"
@@ -21,54 +19,28 @@ MONTHLY_FIGS = [
     ("fig16.gif", "850hPa気温・平年偏差(月平均)"),
 ]
 WAVE_PAGE = "https://www.data.jma.go.jp/waveinf/chart/awjp.html"
-WAVE_IMAGE_URL = os.getenv("WAVE_IMAGE_URL", "").strip()
+WAVE_PDF = "https://www.data.jma.go.jp/waveinf/data/chart/awjp{t:%y%m%d%H}.pdf"
+WAVE_HOURS = [int(h) for h in os.getenv("WAVE_HOURS", "0,6,12,18").split(",") if h.strip()]
 
 
-def last_month(now: datetime) -> str:
-    first = now.astimezone(JST).replace(day=1)
-    return (first - timedelta(days=1)).strftime("%Y%m")
+def wave_candidates(now: datetime, back_hours: int = 30) -> list[datetime]:
+    """新しい順の、沿岸波浪実況図の時刻(UTC)。"""
+    t = now.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    out = []
+    for _ in range(back_hours + 1):
+        if t.hour in WAVE_HOURS:
+            out.append(t)
+        t -= timedelta(hours=1)
+    return out
 
 
-def monthly_urls(ym: str) -> list[tuple[str, str]]:
-    return [(f"{SOKUHO}/{ym}/{name}", title) for name, title in MONTHLY_FIGS]
-
-
-IMG_RE = re.compile(r"""["']([^"'\s]*?(?:awjp|AWJP)[^"'\s]*?\.(?:png|gif|jpg))["']""")
-SCRIPT_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.I)
-
-
-def find_wave_images(html: str, scripts: dict[str, str], base: str) -> list[str]:
-    """ページとスクリプトの中から、沿岸波浪実況図の画像らしいURLを探す(新しそうな順)。"""
-    found = []
-    for text in [html] + list(scripts.values()):   # スクリプトが入れる画像の場所は、ページから見た位置
-        where = base
-        for m in IMG_RE.findall(text):
-            if "{" in m or "+" in m:
-                continue
-            found.append(urljoin(where, m))
-    stamp = lambda u: max(re.findall(r"\d{8,14}", u) or [""])  # noqa: E731
-    return sorted(dict.fromkeys(found), key=stamp, reverse=True)
-
-
-async def wave_image(session) -> tuple[str, bytes] | None:
-    if WAVE_IMAGE_URL:
-        urls = [WAVE_IMAGE_URL]
-    else:
-        async with session.get(WAVE_PAGE) as r:
-            r.raise_for_status()
-            html = await r.text()
-        scripts = {}
-        for src in SCRIPT_RE.findall(html)[:8]:
-            u = urljoin(WAVE_PAGE, src)
-            try:
-                async with session.get(u) as r:
-                    if r.status == 200:
-                        scripts[u] = await r.text()
-            except Exception:
-                pass
-        urls = find_wave_images(html, scripts, WAVE_PAGE)
-    for u in urls[:3]:
-        async with session.get(u) as r:
-            if r.status == 200 and r.headers.get("Content-Type", "").startswith("image"):
-                return u, await r.read()
+async def wave_latest(session, now: datetime, known: datetime | None = None) -> tuple[datetime, str] | None:
+    """公開されている、いちばん新しい図 (時刻, URL)。known より新しいものが無ければ known のまま返す。"""
+    for t in wave_candidates(now):
+        if known is not None and t <= known:
+            return known, WAVE_PDF.format(t=known)
+        url = WAVE_PDF.format(t=t)
+        async with session.head(url, allow_redirects=True) as r:
+            if r.status == 200:
+                return t, url
     return None

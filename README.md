@@ -108,7 +108,6 @@ FXFE502・FXFE5782・AXFE578・AUPQ35・AUPQ78 は1枚に何面も並んだ図�
 - SSIは気象庁の公式の図ではなく、MSMの850hPa気温・湿度と500hPa気温からこのBotが計算した値です
   (空気塊は持ち上げ凝結高度まで乾燥断熱、その上は湿潤断熱。MetPy の showalter_index との差は0.05K程度)。
   MSMのファイルは1回あたり数十MBです。止めるときは `SSI_ENABLED=0`
-- 沿岸波浪実況図は、気象庁のページが読み込んでいる画像を自動で探します。見つからないと表示されたら、
-  ブラウザで気象庁の沿岸波浪実況図を開き、図を右クリック→「画像アドレスをコピー」したURLを `WAVE_IMAGE_URL` に設定してください。
+- 沿岸波浪実況図は、気象庁の `waveinf/data/chart/awjp<年月日時(UTC)>.pdf` を新しい時刻から順に探して投稿します(`WAVE_HOURS` で探す時刻を変更)
 - 出典:気象庁ホームページ、気象庁 ひまわり標準データ(NOAA Open Data Dissemination)、
   背景地図:地理院タイル、海岸線:Natural Earth、図の文字:BIZ UDゴシック(SIL Open Font License)

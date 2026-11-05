@@ -102,38 +102,65 @@ async def find_latest(session, now: datetime) -> tuple[datetime, str] | None:
     return None
 
 
+# GRIB2 の要素の番号 (discipline, parameterCategory, parameterNumber)
+PARAMS = {(0, 0, 0): "t", (0, 1, 1): "r"}
+WANTED = {("t", 850), ("r", 850), ("t", 500)}
+
+
+def _hours(eccodes, h) -> int | None:
+    """予報時間(時間)。単位が分などでも時間に直す。"""
+    try:
+        ft = eccodes.codes_get_long(h, "forecastTime")
+        unit = eccodes.codes_get_long(h, "indicatorOfUnitOfTimeRange")
+    except Exception:
+        try:
+            return int(eccodes.codes_get(h, "endStep"))
+        except Exception:
+            return None
+    return {0: ft // 60, 1: ft, 2: ft * 24, 10: ft * 3, 11: ft * 6, 12: ft * 12, 13: ft // 3600}.get(unit, ft)
+
+
 def decode(path: str, steps: list[int]) -> dict:
     """GRIB2 から 850hPa の気温・湿度と 500hPa の気温を取り出す。{予報時間: (t850, rh850, t500)}"""
     import eccodes
-    out, grid = {}, None
+    out, grid, seen = {}, None, []
     with open(path, "rb") as f:
         while True:
             h = eccodes.codes_grib_new_from_file(f)
             if h is None:
                 break
             try:
-                name = eccodes.codes_get(h, "shortName")
-                level = eccodes.codes_get(h, "level")
-                step = int(eccodes.codes_get(h, "endStep"))
-                if step not in steps or (name, level) not in (("t", 850), ("r", 850), ("t", 500)):
+                g = lambda k: eccodes.codes_get(h, k)  # noqa: E731
+                n = lambda k: eccodes.codes_get_long(h, k)  # noqa: E731
+                key = (n("discipline"), n("parameterCategory"), n("parameterNumber"))
+                name = PARAMS.get(key)
+                level = n("level")
+                surface = n("typeOfFirstFixedSurface")       # 100 = 等圧面
+                if surface == 100 and level > 2000:            # Pa で入っている場合
+                    level //= 100
+                step = _hours(eccodes, h)
+                if len(seen) < 12:
+                    seen.append(f"{g('shortName')}/{key}/面{surface}/{level}/{step}h")
+                if name is None or surface != 100 or (name, level) not in WANTED or step not in steps:
                     continue
-                ni, nj = eccodes.codes_get(h, "Ni"), eccodes.codes_get(h, "Nj")
+                ni, nj = g("Ni"), g("Nj")
                 if grid is None:
-                    grid = (np.linspace(eccodes.codes_get(h, "latitudeOfFirstGridPointInDegrees"),
-                                        eccodes.codes_get(h, "latitudeOfLastGridPointInDegrees"), nj),
-                            np.linspace(eccodes.codes_get(h, "longitudeOfFirstGridPointInDegrees"),
-                                        eccodes.codes_get(h, "longitudeOfLastGridPointInDegrees"), ni))
+                    grid = (np.linspace(g("latitudeOfFirstGridPointInDegrees"),
+                                        g("latitudeOfLastGridPointInDegrees"), nj),
+                            np.linspace(g("longitudeOfFirstGridPointInDegrees"),
+                                        g("longitudeOfLastGridPointInDegrees"), ni))
                 out.setdefault(step, {})[f"{name}{level}"] = eccodes.codes_get_values(h).reshape(nj, ni)
             finally:
                 eccodes.codes_release(h)
     fields = {s: (v["t850"], v["r850"], v["t500"]) for s, v in out.items() if len(v) == 3}
-    return {"grid": grid, "fields": fields}
+    return {"grid": grid, "fields": fields, "seen": seen, "size": os.path.getsize(path)}
 
 
 async def fetch(session, url: str) -> dict:
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "msm.bin"
-        async with session.get(url, timeout=None) as r:
+        import aiohttp
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=900)) as r:
             r.raise_for_status()
             with open(path, "wb") as f:
                 async for chunk in r.content.iter_chunked(1 << 20):

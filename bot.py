@@ -70,6 +70,27 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# 10月の版までにあった種類(これ以外の記録は、新しい版で増えた種類)
+OLD_KEYS_PREFIX = ("kaisetsu_", "season_", "aupq35_", "aupq78_", "aupa20_", "aupa25_", "axfe578_", "fxfe",
+                   "fxjp854_", "asas", "fsas24", "fsas48", "himawari_ir", "himawari_wv", "radar", "rasrf", "amedas")
+STATE_VERSION = 3
+
+
+def migrate_state(state: dict) -> None:
+    """新しい版で増えた種類のうち、起動直後の巡回で「記録だけ」されて、まだ投稿していないものを覚える。"""
+    if state.get("version", 0) >= STATE_VERSION:
+        return
+    skip = {"events", "tc", "case_history", "record_only", "version"}
+    pending = set(state.get("record_only", []))
+    for key in list(state):
+        if key in skip or ":" in key or key.endswith(("_checked", "_retry")):
+            continue
+        if key in ("asas_far", "amedas_map") or not key.startswith(OLD_KEYS_PREFIX):
+            pending.add(key)
+    state["record_only"] = sorted(pending)
+    state["version"] = STATE_VERSION
+
+
 # ---------- PDF → PNG ----------
 def render_pdf(pdf: bytes, pages: int, zoom: float = RENDER_ZOOM) -> list[bytes]:
     """pages=0 なら全ページを画像化する。10MBを超える場合だけ解像度を下げる。"""
@@ -130,6 +151,8 @@ class WeatherBot(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
         self.state = load_state()
+        self.fresh = not self.state          # 初めて起動した(記録が何も無い)
+        migrate_state(self.state)
         self.session: aiohttp.ClientSession | None = None
         self.lock = asyncio.Lock()
         self.fetch_all_mode = False   # /fetch_all の間は、初めて扱う図も投稿する
@@ -269,11 +292,16 @@ class WeatherBot(discord.Client):
     def is_new(self, key: str, value: str) -> str | None:
         """新着ならNone、そうでなければ結果メッセージを返す。"""
         prev = self.state.get(key)
+        pending = self.state.setdefault("record_only", [])
+        if key in pending:                    # 記録だけして、まだ投稿していない → 投稿する
+            pending.remove(key)
+            return None
         if prev == value:
             return "更新なし"
-        if prev is None and not (POST_ON_FIRST_RUN or self.fetch_all_mode):
-            self.state[key] = value
-            return "初回のため記録のみ(次の更新から投稿)"
+        if prev is None and self.fresh and not (POST_ON_FIRST_RUN or self.fetch_all_mode):
+            self.state[key] = value           # 初めての起動のときだけ、今ある分は記録のみ
+            pending.append(key)
+            return "初回のため記録のみ(次の更新か /fetch_all で投稿)"
         return None
 
     # ----- PDF系(解説資料・高層天気図・数値予報天気図) -----
@@ -708,7 +736,8 @@ class WeatherBot(discord.Client):
             return msg
         data = await ssi.fetch(self.session, url)
         if not data["fields"]:
-            return "MSMのデータから850hPa・500hPaの値を読めませんでした"
+            return (f"MSMのデータから850hPa・500hPaの値を読めませんでした(ファイル {data['size'] / 1e6:.1f}MB、"
+                    f"中身の例:{', '.join(data['seen'][:8]) or 'GRIBとして読めず'})")
         lats, lons = data["grid"]
         font = await self.font()
         mark = self.marker("ssi", value)
@@ -767,29 +796,36 @@ class WeatherBot(discord.Client):
 
     # ----- 沿岸波浪実況図 -----
     async def check_wave(self) -> str:
-        found = await extra_sources.wave_image(self.session)
+        known = self.state.get("wave_time")
+        found = await extra_sources.wave_latest(self.session, datetime.now(timezone.utc),
+                                                datetime.fromisoformat(known) if known else None)
         if found is None:
-            return ("画像の場所が見つかりません(気象庁のページの作りが想定と違います。"
-                    "WAVE_IMAGE_URL に画像のURLを設定してください)")
-        url, data = found
-        value = hashlib.sha1(data).hexdigest()
+            return "公開されている図が見つかりません"
+        t, url = found
+        value = t.strftime("%Y%m%d%H")
         if (msg := self.is_new("wave", value)) is not None:
             return msg
         channel = self.find_channel("沿岸波浪実況図")
         if channel is None:
             return "#沿岸波浪実況図 が見つかりません(/setup_weather を実行)"
         if (msg := await self.skip_if_posted(channel, "wave", value)) is not None:
+            self.state["wave_time"] = t.isoformat()
             return msg
+        pdf = await self.get_bytes(url)
+        images = await asyncio.to_thread(render_pdf, pdf, 1)
         mark = self.marker("wave", value)
-        ext = url.rsplit(".", 1)[-1].lower()
+        jst = t.astimezone(JST)
         embed = discord.Embed(title="沿岸波浪実況図", url=extra_sources.WAVE_PAGE, color=0x2B6CB0,
                               description="日本沿岸の波の高さ・周期・向きの実況")
+        embed.add_field(name="観測時刻", value=time_text(t), inline=False)
         embed.add_field(name="出典", value="気象庁", inline=True)
+        embed.add_field(name="元の図", value=f"[PDF]({url})", inline=True)
         embed.set_footer(text=f"検知 {now_jst_text()}|図中の時刻はUTC(JST=UTC+9)")
-        embed.set_image(url=f"attachment://{mark}.{ext}")
-        sent = await channel.send(embed=embed, file=discord.File(io.BytesIO(data), filename=f"{mark}.{ext}"))
-        await self.archive_post(sent, "沿岸波浪実況図")
+        embed.set_image(url=f"attachment://{mark}.png")
+        sent = await channel.send(embed=embed, file=discord.File(io.BytesIO(images[0]), filename=f"{mark}.png"))
+        await self.archive_post(sent, f"沿岸波浪実況図 {jst:%m/%d %H時}")
         self.state["wave"] = value
+        self.state["wave_time"] = t.isoformat()
         return "✅ 投稿しました"
 
     # ----- 過去データ -----
