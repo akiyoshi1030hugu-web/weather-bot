@@ -24,6 +24,7 @@ import amedas_map
 import extra_sources
 import panels
 import past
+import ssi
 from charts import ensure_font
 import himawari_hsd as hsd
 import typhoon as tcmod
@@ -216,6 +217,7 @@ class WeatherBot(discord.Client):
             results.append(await self.safe("ひまわり B07・差分画像", self.check_hsd()))
             results.append(await self.safe("ウィンドプロファイラ", self.check_windprofiler()))
             results.append(await self.safe("アメダス天気図", self.check_amedas_map()))
+            results.append(await self.safe("SSI分布", self.check_ssi()))
             results.append(await self.safe("月平均天気図", self.check_monthly()))
             results.append(await self.safe("沿岸波浪実況図", self.check_wave()))
             save_state(self.state)
@@ -686,6 +688,48 @@ class WeatherBot(discord.Client):
         sent = await self.send_files(channel, embed, items, "アメダス天気図")
         await self.archive_post(sent, f"アメダス天気図 {t:%H時}")
         self.state["amedas_map"] = value
+        return "✅ 投稿しました"
+
+    # ----- SSI分布(MSMから計算) -----
+    async def check_ssi(self) -> str:
+        if not ssi.ENABLED:
+            return "無効(SSI_ENABLED=0)"
+        found = await ssi.find_latest(self.session, datetime.now(timezone.utc))
+        if found is None:
+            return "MSMのデータが見つかりません(京都大学のアーカイブに、まだ届いていない可能性があります)"
+        init, url = found
+        value = init.strftime("%Y%m%d%H")
+        if (msg := self.is_new("ssi", value)) is not None:
+            return msg
+        channel = self.find_channel("ssi分布")
+        if channel is None:
+            return "#ssi分布 が見つかりません(/setup_weather を実行)"
+        if (msg := await self.skip_if_posted(channel, "ssi", value)) is not None:
+            return msg
+        data = await ssi.fetch(self.session, url)
+        if not data["fields"]:
+            return "MSMのデータから850hPa・500hPaの値を読めませんでした"
+        lats, lons = data["grid"]
+        font = await self.font()
+        mark = self.marker("ssi", value)
+        items = []
+        for step in sorted(data["fields"]):
+            t850, rh850, t500 = data["fields"][step]
+            value_k = await asyncio.to_thread(ssi.ssi, t850, rh850, t500)
+            png = await asyncio.to_thread(ssi.render, init, step, lats, lons, value_k, font)
+            items.append((f"{mark}-ft{step:02d}.png", png))
+        jst = init.astimezone(JST)
+        embed = discord.Embed(title="SSI分布(ショワルター安定指数)", url=ssi.PAGE_URL, color=0xC53030,
+                              description="SSI = 500hPaの気温 − 850hPaの空気塊を500hPaまで持ち上げたときの温度。"
+                                          "小さい(負)ほど不安定\n気象庁MSMの気圧面データから格子ごとに計算した値です")
+        embed.add_field(name="初期時刻", value=f"{jst:%Y-%m-%d %H:%M} JST({init:%H} UTC)", inline=True)
+        embed.add_field(name="図", value="、".join("初期値" if s == 0 else f"{s}時間予想" for s in sorted(data["fields"])),
+                        inline=True)
+        embed.add_field(name="出典", value="気象庁 MSM(京都大学生存圏研究所 気象庁データアーカイブ)", inline=False)
+        embed.set_image(url=f"attachment://{items[0][0]}")
+        sent = await self.send_files(channel, embed, items, "SSI分布")
+        await self.archive_post(sent, f"SSI分布 {jst:%m/%d %H時}初期値")
+        self.state["ssi"] = value
         return "✅ 投稿しました"
 
     # ----- 月平均天気図(気候系監視速報) -----

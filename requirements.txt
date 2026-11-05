@@ -9,3 +9,5 @@ beautifulsoup4>=4.12
 # ひまわり I4・W2・W3・S1・S2(気象庁の HSD を読む)
 satpy>=0.50
 pyresample>=1.28
+# SSI分布(気象庁MSMのGRIB2を読む)
+eccodes>=2.38
