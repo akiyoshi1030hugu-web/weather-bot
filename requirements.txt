@@ -1,0 +1,11 @@
+discord.py>=2.4
+aiohttp>=3.9
+pymupdf>=1.24
+python-dotenv>=1.0
+Pillow>=10.1
+numpy>=1.26
+matplotlib>=3.8
+beautifulsoup4>=4.12
+# ひまわり I4・W2・W3・S1・S2(気象庁の HSD を読む)
+satpy>=0.50
+pyresample>=1.28
